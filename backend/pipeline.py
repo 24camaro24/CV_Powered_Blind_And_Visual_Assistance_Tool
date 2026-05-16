@@ -1,13 +1,9 @@
 import os
-# DISABLE CUDA FIRST - before torch is imported
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['CUDA_HOME'] = ''
-os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+import logging
 
-# Disable HuggingFace model downloads if cache not available
-os.environ['HF_HUB_OFFLINE'] = '0'  # Allow online but will fallback to cache
-os.environ['TRANSFORMERS_OFFLINE'] = '0'  # Allow online but will fallback to cache
+# Allow HuggingFace downloads by default, while letting callers override.
+os.environ.setdefault('HF_HUB_OFFLINE', '0')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '0')
 os.environ['TRANSFORMERS_CACHE'] = os.path.expanduser('~/.cache/huggingface/transformers')
 
 import torch
@@ -20,114 +16,9 @@ from pathlib import Path
 import signal
 import sys
 
-# Disable CUDA in torch explicitly after import
-try:
-    # Patch cuda module to fake CUDA support
-    torch.cuda.is_available = lambda: False
-    torch.cuda.device_count = lambda: 0
-    torch.cuda.current_device = lambda: -1
-    torch.cuda.get_device_name = lambda *args, **kwargs: "cpu"
-    torch.cuda._initialized = False
-    torch.cuda.is_initialized = lambda *args, **kwargs: False
-    torch.cuda.init = lambda *args, **kwargs: None
-    torch._C._cuda_init = None
-    
-    # Additional aggressive CUDA disabling
-    torch.cuda.device = lambda x: None
-    torch.cuda.empty_cache = lambda: None
-    torch.cuda.synchronize = lambda: None
-    torch.cuda.reset_peak_memory_stats = lambda *args, **kwargs: None
-    torch.cuda.memory_stats = lambda *args, **kwargs: {}
-    torch.cuda.mem_get_info = lambda *args, **kwargs: (1024*1024*1024, 1024*1024*1024)  # Fake 1GB free
-    
-    # CRITICAL FIX: Monkeypatch Tensor.to() to handle device parameter correctly
-    original_tensor_to = torch.Tensor.to
-    def fixed_tensor_to(self, *args, **kwargs):
-        """Fixed .to() that handles bad device parameters"""
-        try:
-            # Try normal .to() first
-            return original_tensor_to(self, *args, **kwargs)
-        except TypeError as e:
-            if "to() received an invalid combination" in str(e):
-                # If .to() gets bad arguments, try to fix them
-                # Check if device is being passed as dtype
-                if len(args) > 0:
-                    first_arg = args[0]
-                    if isinstance(first_arg, torch.device):
-                        # Device is a torch.device object - convert to CPU directly
-                        return self.cpu()
-                    elif isinstance(first_arg, str):
-                        # Device is a string
-                        if first_arg == 'cpu' or 'cpu' in str(first_arg):
-                            return self.cpu()
-                # If we can't figure it out, just return on CPU
-                return self.cpu()
-            else:
-                raise
-    
-    torch.Tensor.to = fixed_tensor_to
-    print("[CUDA PATCH] Monkeypatched Tensor.to() to handle device errors")
-    
-    # FIX: Patch subtract operation to handle bool tensors
-    # When bool tensors are subtracted, convert to float first
-    original_sub = torch.Tensor.__sub__
-    def fixed_sub(self, other):
-        if self.dtype == torch.bool:
-            return original_sub(self.float(), other)
-        elif isinstance(other, torch.Tensor) and other.dtype == torch.bool:
-            return original_sub(self, other.float())
-        return original_sub(self, other)
-    torch.Tensor.__sub__ = fixed_sub
-    
-    original_rsub = torch.Tensor.__rsub__
-    def fixed_rsub(self, other):
-        if self.dtype == torch.bool:
-            return original_rsub(self.float(), other)
-        elif isinstance(other, torch.Tensor) and other.dtype == torch.bool:
-            return original_rsub(self, other.float())
-        return original_rsub(self, other)
-    torch.Tensor.__rsub__ = fixed_rsub
-    
-    # Also patch torch.sub function
-    original_torch_sub = torch.sub
-    def fixed_torch_sub(input, other, *, alpha=1, out=None):
-        if input.dtype == torch.bool:
-            input = input.float()
-        if isinstance(other, torch.Tensor) and other.dtype == torch.bool:
-            other = other.float()
-        return original_torch_sub(input, other, alpha=alpha, out=out)
-    torch.sub = fixed_torch_sub
-    
-    # FIX: Patch torch.finfo() to handle device objects passed as dtype
-    original_finfo = torch.finfo
-    def fixed_finfo(dtype):
-        """Handle case where torch.device is passed instead of dtype"""
-        if isinstance(dtype, torch.device):
-            # Device passed instead of dtype - return float32 info
-            return original_finfo(torch.float32)
-        return original_finfo(dtype)
-    torch.finfo = fixed_finfo
-    
-    # FIX: Patch torch.iinfo() to handle device objects passed as dtype
-    original_iinfo = torch.iinfo
-    def fixed_iinfo(dtype):
-        """Handle case where torch.device is passed instead of dtype"""
-        if isinstance(dtype, torch.device):
-            # Device passed instead of dtype - return int32 info
-            return original_iinfo(torch.int32)
-        return original_iinfo(dtype)
-    torch.iinfo = fixed_iinfo
-    
-    print("[CUDA PATCH] Monkeypatched subtraction operations for bool tensors")
-except Exception as e:
-    print(f"[CUDA Patch] Warning: {e}")
-
-# Ensure no MPS either (macOS specific)
-if hasattr(torch.backends, 'mps'):
-    try:
-        torch.backends.mps.enabled = False
-    except:
-        pass
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # FIX: Patch BertModel BEFORE importing GroundingDINO
 try:
@@ -146,9 +37,22 @@ try:
                 head_mask = [None] * num_hidden_layers
             return head_mask
         BertModel.get_head_mask = get_head_mask
-        print("[PATCH] Added get_head_mask to BertModel")
+        logger.info("Added missing get_head_mask to BertModel")
+
+    import inspect
+    extended_mask_params = list(inspect.signature(BertModel.get_extended_attention_mask).parameters)
+    if len(extended_mask_params) >= 4 and extended_mask_params[3] == "dtype":
+        original_get_extended_attention_mask = BertModel.get_extended_attention_mask
+
+        def get_extended_attention_mask_compat(self, attention_mask, input_shape, dtype=None):
+            if isinstance(dtype, torch.device):
+                dtype = None
+            return original_get_extended_attention_mask(self, attention_mask, input_shape, dtype=dtype)
+
+        BertModel.get_extended_attention_mask = get_extended_attention_mask_compat
+        logger.info("Patched BertModel.get_extended_attention_mask for GroundingDINO compatibility")
 except Exception as e:
-    print(f"[PATCH WARNING] Could not patch BertModel: {e}")
+    logger.warning("Could not patch BertModel: %s", e)
 
 # GroundingDINO
 from groundingdino.util.inference import load_model, predict, load_image
@@ -159,7 +63,7 @@ original_predict = groundingdino_inference.predict
 
 def patched_predict(model, image, caption, box_threshold, text_threshold, device='cpu', remove_combined=False):
     """
-    Fixed version - NO .to() calls. Subtraction operator patched for bool tensors.
+    GroundingDINO predict variant that expects caller-managed model/image devices.
     """
     from groundingdino.util.inference import preprocess_caption, get_phrases_from_posmap
     import bisect
@@ -177,7 +81,6 @@ def patched_predict(model, image, caption, box_threshold, text_threshold, device
     prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]
     prediction_boxes = outputs["pred_boxes"].cpu()[0]
     
-    # These comparisons will create bool tensors, but subtraction on them will work
     mask = prediction_logits.max(dim=1)[0] > box_threshold
     logits = prediction_logits[mask]
     boxes = prediction_boxes[mask]
@@ -205,11 +108,8 @@ def patched_predict(model, image, caption, box_threshold, text_threshold, device
 # Replace the predict function
 groundingdino_inference.predict = patched_predict
 predict = patched_predict
-print("[PATCH] GroundingDINO predict() patched - Tensor.to() fix in place")
+logger.info("GroundingDINO predict function patched")
 
-
-# Depth Anything V2
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 # Audio LLM (faster-whisper)
 from faster_whisper import WhisperModel
@@ -217,8 +117,8 @@ from faster_whisper import WhisperModel
 # Local instruction LLM
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# TTS - Import lazily to avoid slow scipy load on macOS
-TTS = None  # Will be imported on first use
+# TTS import is cached after first load.
+TTS_API_CLASS = None
 
 
 # Timeout helper for long-running operations
@@ -235,11 +135,11 @@ def load_with_timeout(load_func, timeout_secs=30, model_name="model"):
             signal.alarm(timeout_secs)
             result = load_func()
             signal.alarm(0)  # Cancel alarm
-            print(f"[SUCCESS] {model_name} loaded successfully")
+            logger.info("%s loaded successfully", model_name)
             return result
         except TimeoutError:
             signal.alarm(0)  # Cancel alarm
-            print(f"[TIMEOUT] {model_name} loading took too long (>{timeout_secs}s), may be downloading...")
+            logger.warning("%s loading timed out after %ss", model_name, timeout_secs)
             return None
         except Exception as e:
             signal.alarm(0)  # Cancel alarm
@@ -460,165 +360,166 @@ class FewShotMatcher:
 
 
 class NavigationPipeline:
-    def __init__(self, device='cpu'):
-        # Use CPU - stable for all platforms
-        self.device = 'cpu'
-        print("[✓] Using CPU for all models (stable inference)")
-        
-        # Initialize FewShotMatcher for few-shot learning
+    DEFAULT_DEPTH_MODEL = "depth-anything/DA3METRIC-LARGE"
+    DEFAULT_WHISPER_MODEL = "small"
+    DEFAULT_INSTRUCTION_MODEL = "google/flan-t5-small"
+    DEFAULT_TTS_MODEL = "tts_models/en/ljspeech/tacotron2-DDC"
+
+    def __init__(self, device='auto'):
+        self.requested_device = device or 'auto'
+        self.torch_device = self._resolve_device(self.requested_device)
+        self.device = str(self.torch_device)
+        self.grounding_model = None
+        self.depth_model = None
+        self.depth_processor = None
+        self.whisper_model = None
+        self.instr_tokenizer = None
+        self.instr_model = None
+        self.tts = None
         self.few_shot_matcher = None
-        
-        try:
-            self.load_models()
-            # Initialize FewShotMatcher after models are loaded
-            self.few_shot_matcher = FewShotMatcher(device='cpu')
-            print("[✓] FewShotMatcher initialized for few-shot learning")
-        except RuntimeError as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[WARNING] Ignoring CUDA error during initialization: {e}")
-            else:
-                raise
+        self.model_status = {}
+
+        self.depth_model_name = os.getenv("DEPTH_ANYTHING_MODEL", self.DEFAULT_DEPTH_MODEL)
+        self.whisper_model_name = os.getenv("WHISPER_MODEL", self.DEFAULT_WHISPER_MODEL)
+        self.instruction_model_name = os.getenv("INSTRUCTION_MODEL", self.DEFAULT_INSTRUCTION_MODEL)
+        self.tts_model_name = os.getenv("TTS_MODEL", self.DEFAULT_TTS_MODEL)
+
+        logger.info("NavigationPipeline using device=%s", self.device)
+        self.load_models()
+        self._load_few_shot_matcher()
+
+    def _resolve_device(self, requested_device):
+        if isinstance(requested_device, torch.device):
+            requested = requested_device.type
+        else:
+            requested = str(requested_device or 'auto').lower()
+
+        if requested in ('auto', 'gpu', 'cuda'):
+            if torch.cuda.is_available():
+                return torch.device('cuda')
+            if requested in ('gpu', 'cuda'):
+                logger.warning("CUDA was requested but is not available; falling back to CPU")
+            return torch.device('cpu')
+
+        if requested == 'cpu':
+            return torch.device('cpu')
+
+        logger.warning("Unknown device '%s'; falling back to auto selection", requested_device)
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     def get_device_str(self):
-        """Get device as string - returns GPU or CPU based on availability"""
+        """Get the active torch device as a string."""
         return self.device
     
     def load_models(self):
-        """Load all required models on CPU"""
-        
-        print("Loading GroundingDINO...")
+        """Load the models used by the pipeline."""
+        self.grounding_model = self._try_load_model(
+            "GroundingDINO",
+            self._load_grounding_model,
+            timeout_secs=60,
+        )
+        self.depth_model = self._try_load_model(
+            "Depth Anything 3",
+            self._load_depth_model,
+            timeout_secs=180,
+        )
+        self.whisper_model = self._try_load_model(
+            "Whisper",
+            self._load_whisper_model,
+            timeout_secs=60,
+        )
+
+        instruction_result = self._try_load_model(
+            "Flan-T5",
+            self._load_instruction_model,
+            timeout_secs=60,
+        )
+        if instruction_result is not None:
+            self.instr_tokenizer, self.instr_model = instruction_result
+
+        self.tts = self._try_load_model(
+            "TTS",
+            self._load_tts_model,
+            timeout_secs=120,
+        )
+        self._log_model_summary()
+
+    def _try_load_model(self, label, loader, timeout_secs):
+        logger.info("Loading %s...", label)
         try:
-            base_dir = Path(__file__).parent.parent
-            config_path = str(base_dir / "GroundingDINO_SwinT_OGC.py")
-            model_path = str(base_dir / "groundingdino_swint_ogc.pth")
-            self.grounding_model = load_model(config_path, model_path)
-            self.grounding_model.eval()
-            
-            # Keep on CPU
-            for param in self.grounding_model.parameters():
-                param.data = param.data.cpu()
-            for buffer in self.grounding_model.buffers():
-                buffer.data = buffer.data.cpu()
-            
-            print("[✓] GroundingDINO loaded on CPU")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] GroundingDINO CUDA error: {e}")
-                self.grounding_model = None
-            else:
-                print(f"[✗] GroundingDINO failed: {e}")
-                self.grounding_model = None
-        
-        print("Loading Depth Anything V2...")
+            result = load_with_timeout(loader, timeout_secs=timeout_secs, model_name=label)
+            if result is None:
+                raise TimeoutError(f"{label} did not finish loading within {timeout_secs}s")
+            self.model_status[label] = "loaded"
+            logger.info("%s ready on %s", label, self.device)
+            return result
+        except Exception as exc:
+            self.model_status[label] = f"failed: {exc}"
+            logger.error("%s failed to load: %s", label, exc)
+            return None
+
+    def _load_grounding_model(self):
+        base_dir = Path(__file__).parent.parent
+        config_path = str(base_dir / "GroundingDINO_SwinT_OGC.py")
+        model_path = str(base_dir / "groundingdino_swint_ogc.pth")
+        model = load_model(config_path, model_path, device=self.device)
+        model = model.to(self.torch_device)
+        model.eval()
+        return model
+
+    def _load_depth_model(self):
+        from depth_anything_3.api import DepthAnything3
+
+        model = DepthAnything3.from_pretrained(self.depth_model_name)
+        model = model.to(device=self.torch_device)
+        model.eval()
+        return model
+
+    def _load_whisper_model(self):
+        whisper_device = "cuda" if self.torch_device.type == "cuda" else "cpu"
+        compute_type = "float16" if whisper_device == "cuda" else "int8"
+        return WhisperModel(self.whisper_model_name, device=whisper_device, compute_type=compute_type)
+
+    def _load_instruction_model(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.instruction_model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(self.instruction_model_name)
+        model = model.to(self.torch_device)
+        model.eval()
+        return tokenizer, model
+
+    def _load_tts_model(self):
+        global TTS_API_CLASS
+        if TTS_API_CLASS is None:
+            from TTS.api import TTS as TTS_API
+            TTS_API_CLASS = TTS_API
+        return TTS_API_CLASS(
+            model_name=self.tts_model_name,
+            progress_bar=False,
+            gpu=self.torch_device.type == "cuda",
+        )
+
+    def _load_few_shot_matcher(self):
         try:
-            def load_depth():
-                processor = AutoImageProcessor.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                model = AutoModelForDepthEstimation.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                return processor, model
-            
-            self.depth_processor, self.depth_model = load_with_timeout(
-                load_depth, timeout_secs=60, model_name="Depth Anything V2"
-            ) or (None, None)
-            
-            if self.depth_model is not None:
-                self.depth_model.eval()
-                try:
-                    self.depth_model = self.depth_model.to('cpu')
-                except:
-                    pass
-                print("[✓] Depth Anything V2 loaded on CPU")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] Depth V2 CUDA error: {e}")
-            else:
-                print(f"[✗] Depth V2 failed: {e}")
-            self.depth_model = None
-            self.depth_processor = None
-        print("Loading Whisper...")
-        try:
-            def load_whisper():
-                return WhisperModel("small", device='cpu')
-            
-            self.whisper_model = load_with_timeout(
-                load_whisper, timeout_secs=60, model_name="Whisper"
-            )
-            if self.whisper_model is not None:
-                print("[✓] Whisper loaded")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] Whisper CUDA error: {e}")
-            else:
-                print(f"[✗] Whisper failed: {e}")
-            self.whisper_model = None
-        
-        print("Loading Flan-T5...")
-        try:
-            def load_t5():
-                tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
-                model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
-                return tokenizer, model
-            
-            result = load_with_timeout(load_t5, timeout_secs=60, model_name="Flan-T5")
-            if result:
-                self.instr_tokenizer, self.instr_model = result
-                self.instr_model.eval()
-                try:
-                    self.instr_model = self.instr_model.to('cpu')
-                except:
-                    pass
-                print("[✓] Flan-T5 loaded")
-            else:
-                self.instr_tokenizer = None
-                self.instr_model = None
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] Flan-T5 CUDA error: {e}")
-            else:
-                print(f"[✗] Flan-T5 failed: {e}")
-            self.instr_model = None
-            self.instr_tokenizer = None
-        
-        print("Loading TTS...")
-        try:
-            def load_tts():
-                # Lazy import of TTS to avoid slow scipy load on macOS
-                global TTS
-                if TTS is None:
-                    print("  [TTS] Importing TTS module (this may take 30+ seconds)...")
-                    from TTS.api import TTS as TTS_API
-                    TTS = TTS_API
-                return TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
-            
-            self.tts = load_with_timeout(load_tts, timeout_secs=120, model_name="TTS")
-            if self.tts is not None:
-                print("[SUCCESS] TTS loaded successfully")
-                print("[✓] TTS loaded")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] TTS CUDA error: {e}")
-            else:
-                print(f"[✗] TTS failed: {e}")
-            self.tts = None
-        
-        print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║           Models Initialization Complete                    ║
-║                                                              ║
-║  GroundingDINO: {'✓ loaded' if self.grounding_model else '✗ failed'}                        
-║  Depth Anything V2: {'✓ loaded' if self.depth_model else '✗ failed'}                   
-║  Whisper: {'✓ loaded' if self.whisper_model else '✗ failed'}                          
-║  Flan-T5: {'✓ loaded' if self.instr_model else '✗ failed'}                              
-║  TTS: {'✓ loaded' if self.tts else '✗ failed'}                                
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
-""")
-    
+            self.few_shot_matcher = FewShotMatcher(device=self.device)
+            self.model_status["FewShotMatcher"] = "loaded"
+            logger.info("FewShotMatcher ready on %s", self.device)
+        except Exception as exc:
+            self.few_shot_matcher = None
+            self.model_status["FewShotMatcher"] = f"failed: {exc}"
+            logger.error("FewShotMatcher failed to initialize: %s", exc)
+
+    def _log_model_summary(self):
+        summary = ", ".join(f"{name}={status}" for name, status in self.model_status.items())
+        logger.info("Model load summary: %s", summary)
+
+    def _require_models(self, *requirements):
+        missing = [label for attr, label in requirements if getattr(self, attr, None) is None]
+        if missing:
+            raise RuntimeError("Required model(s) not loaded: " + ", ".join(missing))
+
     def transcribe_audio(self, audio_path):
         """Transcribe audio to text using Whisper"""
+        self._require_models(("whisper_model", "Whisper"))
         segments, info = self.whisper_model.transcribe(audio_path)
         text = " ".join([segment.text for segment in segments])
         return text
@@ -732,38 +633,17 @@ class NavigationPipeline:
     
     def text_to_speech(self, text):
         """Convert text to speech"""
+        self._require_models(("tts", "TTS"))
         tts_path = "instruction.wav"
         self.tts.tts_to_file(text=text, file_path=tts_path)
         return tts_path
     
-    def verify_models_on_cpu(self):
-        """Verify that all models are on CPU by moving parameters directly (not using .to())"""
-        try:
-            # GroundingDINO
-            if self.grounding_model is not None:
-                for param in self.grounding_model.parameters():
-                    if param.is_cuda or str(param.device) != 'cpu':
-                        param.data = param.data.cpu()
-                for buffer in self.grounding_model.buffers():
-                    if buffer.is_cuda or str(buffer.device) != 'cpu':
-                        buffer.data = buffer.data.cpu()
-            
-            # Depth model
-            if self.depth_model is not None:
-                try:
-                    self.depth_model = self.depth_model.to('cpu')
-                except:
-                    pass
-            
-            # Instruction model
-            if self.instr_model is not None:
-                try:
-                    self.instr_model = self.instr_model.to('cpu')
-                except:
-                    pass
-                    
-        except Exception as e:
-            print(f"[WARNING] Could not verify models on CPU: {e}")
+    def estimate_depth(self, image):
+        """Estimate a depth map with Depth Anything 3."""
+        self._require_models(("depth_model", "Depth Anything 3"))
+        prediction = self.depth_model.inference([image], export_format="mini_npz")
+        depth_map = prediction.depth[0]
+        return np.asarray(depth_map, dtype=np.float32)
     
     def enhance_detection_caption(self, target):
         """Enhance detection caption for small gadgets and electronics"""
@@ -847,7 +727,7 @@ class NavigationPipeline:
             try:
                 # Standard thresholds - balance between accuracy and false positives
                 detect_image = image_tensor if use_tensor else image_np
-                surf_boxes, surf_logits, surf_phrases = self.predict_with_cpu_fallback(
+                surf_boxes, surf_logits, surf_phrases = self.predict_with_model_device(
                     model=self.grounding_model,
                     image=detect_image,
                     caption=surface,
@@ -975,63 +855,34 @@ class NavigationPipeline:
         
         return steps, distance
     
-    def predict_with_cpu_fallback(self, model, image, caption, box_threshold=0.3, text_threshold=0.25):
-        """
-        Wrapper that ensures everything is on CPU with correct dtypes BEFORE calling predict.
-        Enhanced with better small object detection support.
-        """
-        print(f"[PREDICT] Preparing for inference with caption: {caption}")
-        
-        # Ensure image is a proper tensor
+    def predict_with_model_device(self, model, image, caption, box_threshold=0.3, text_threshold=0.25):
+        """Prepare tensors and run GroundingDINO on the configured device."""
+        if model is None:
+            raise RuntimeError("Required model(s) not loaded: GroundingDINO")
+
+        logger.info("GroundingDINO inference caption=%s", caption)
+
         if isinstance(image, np.ndarray):
-            print(f"[PREDICT] Converting numpy array (shape: {image.shape}) to tensor")
-            # Normalize uint8 to [0, 1] if needed
             if image.dtype == np.uint8:
                 image = image.astype(np.float32) / 255.0
-                print(f"[PREDICT] Normalized uint8 image to [0, 1] range")
-            # Convert to tensor as-is (keep HWC format)
             image = torch.from_numpy(image).float()
-            print(f"[PREDICT] Converted to tensor: shape={image.shape}, dtype={image.dtype}")
-            image = image.to('cpu')
-        elif hasattr(image, 'to'):
-            image = image.to('cpu')
-            print(f"[PREDICT] Image moved to CPU")
-        
-        # Verify format
-        if hasattr(image, 'dtype'):
-            if isinstance(image, torch.Tensor) and image.dtype not in [torch.float32, torch.float64]:
-                print(f"[PREDICT] Converting image from {image.dtype} to float32")
+
+        if isinstance(image, torch.Tensor):
+            if image.dtype not in (torch.float32, torch.float64):
                 image = image.float()
-        
-        print(f"[PREDICT] Final image: dtype={image.dtype}, shape={image.shape}")
-        
-        # Ensure all model parameters are on CPU before predict is called
-        try:
-            for param in model.parameters():
-                if param.is_cuda or str(param.device) != 'cpu':
-                    param.data = param.data.cpu()
-            for buffer in model.buffers():
-                if buffer.is_cuda or str(buffer.device) != 'cpu':
-                    buffer.data = buffer.data.cpu()
-            print(f"[PREDICT] Model moved to CPU")
-        except:
-            print(f"[PREDICT] Could not move model to CPU, continuing anyway...")
-        
-        # Call predict
-        print(f"[PREDICT] Calling predict() with device='cpu'")
-        try:
-            boxes, logits, phrases = predict(
-                model=model,
-                image=image,
-                caption=caption,
-                box_threshold=box_threshold,
-                text_threshold=text_threshold,
-                device='cpu'
-            )
-            print(f"[PREDICT] SUCCESS - found {len(boxes)} boxes")
-        except Exception as e:
-            print(f"[PREDICT] FAILED - {str(e)}")
-            raise
+            image = image.to(self.torch_device)
+
+        model = model.to(self.torch_device)
+
+        boxes, logits, phrases = predict(
+            model=model,
+            image=image,
+            caption=caption,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            device=self.device
+        )
+        logger.info("GroundingDINO found %s box(es)", len(boxes))
         return boxes, logits, phrases
     
     def hybrid_detect_and_match(self, image_np, image_tensor, target, dino_boxes, dino_logits):
@@ -1101,32 +952,31 @@ class NavigationPipeline:
         start_time = time.time()
         
         try:
-            # Verify models are on CPU before starting
-            self.verify_models_on_cpu()
+            self._require_models(
+                ("grounding_model", "GroundingDINO"),
+                ("depth_model", "Depth Anything 3"),
+            )
             
             # Load image
             image_source, image_tensor = load_image(image_path)
             img_np = np.array(image_source)
             h, w, _ = img_np.shape
             
-            # Ensure image tensor is on CPU and correct dtype
+            # Ensure image tensor is on the selected device and correct dtype
             if hasattr(image_tensor, 'to'):
-                image_tensor = image_tensor.to('cpu')
+                image_tensor = image_tensor.to(self.torch_device)
             
-            # Ensure image is float32 (critical for avoiding bool tensor errors)
             if isinstance(image_tensor, torch.Tensor):
                 if image_tensor.dtype not in [torch.float32, torch.float64]:
-                    print(f"[PROCESS] Converting image from {image_tensor.dtype} to float32")
                     image_tensor = image_tensor.float()
-                print(f"[PROCESS] Image tensor: dtype={image_tensor.dtype}, shape={image_tensor.shape}")
             
             # Enhance detection caption for better small object detection
             enhanced_caption = self.enhance_detection_caption(target)
-            print(f"[PROCESS] Enhanced caption: {enhanced_caption}")
+            logger.info("Enhanced detection caption=%s", enhanced_caption)
             
             # Detect target using GroundingDINO with enhanced caption
             try:
-                boxes, logits, phrases = self.predict_with_cpu_fallback(
+                boxes, logits, phrases = self.predict_with_model_device(
                     model=self.grounding_model,
                     image=image_tensor,
                     caption=enhanced_caption,
@@ -1135,7 +985,7 @@ class NavigationPipeline:
                 )
             except Exception as e:
                 error_msg = str(e)
-                print(f"[ERROR] GroundingDINO prediction failed: {error_msg}")
+                logger.error("GroundingDINO prediction failed: %s", error_msg)
                 return {
                     'success': False,
                     'error': f'Object detection failed: {error_msg}'
@@ -1149,7 +999,7 @@ class NavigationPipeline:
             
             # Activate Siamese network: boost confidence using few-shot matching if available
             logits = self.hybrid_detect_and_match(img_np, image_tensor, target, boxes, logits)
-            print(f"[PIPELINE] Post-Siamese confidence: {float(logits[0].item()) if torch.is_tensor(logits[0]) else float(logits[0])}")
+            logger.info("Post-Siamese confidence=%s", float(logits[0].item()) if torch.is_tensor(logits[0]) else float(logits[0]))
             
             # Get bounding box
             box = boxes[0] * torch.tensor([w, h, w, h])
@@ -1167,30 +1017,17 @@ class NavigationPipeline:
             
             object_width = x2 - x1
             
-            # Estimate depth
-            with torch.no_grad():
-                try:
-                    inputs = self.depth_processor(images=image_source, return_tensors="pt")
-                    # Ensure inputs are on GPU if available
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-                    outputs = self.depth_model(**inputs)
-                    depth = outputs.predicted_depth.to('cpu')
-                except Exception as depth_error:
-                    print(f"[ERROR] Depth estimation failed: {depth_error}")
-                    return {
-                        'success': False,
-                        'error': f'Depth estimation error: {str(depth_error)}'
-                    }
-            
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(1),
-                size=(h, w),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-            
-            depth_map = depth.detach().cpu().numpy()
+            try:
+                depth_map = self.estimate_depth(img_np)
+                if depth_map.shape[:2] != (h, w):
+                    depth_map = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_CUBIC)
+            except Exception as depth_error:
+                logger.error("Depth Anything 3 estimation failed: %s", depth_error)
+                return {
+                    'success': False,
+                    'error': f'Depth estimation error: {str(depth_error)}'
+                }
+
             obj_depth = depth_map[y1:y2, x1:x2].mean()
             
             # Use improved depth-to-steps conversion

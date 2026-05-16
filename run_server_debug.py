@@ -13,11 +13,6 @@ def timeout_handler(signum, frame):
 signal.signal(signal.SIGALRM, timeout_handler)
 signal.alarm(60)
 
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['CUDA_HOME'] = ''
-os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
-
 print("[SERVER] Starting Flask server wrapper...", flush=True)
 print("[SERVER] Python version:", sys.version.split()[0], flush=True)
 print("[SERVER] Working directory:", os.getcwd(), flush=True)
@@ -57,7 +52,7 @@ try:
     
     print("\n[SERVER] Phase 6: Initializing NavigationPipeline...", flush=True)
     print("[SERVER]   This may take 30-60 seconds for model loading...", flush=True)
-    pipeline = NavigationPipeline(device='cpu')
+    pipeline = NavigationPipeline(device='auto')
     print("[SERVER] ✓ Pipeline initialized", flush=True)
     
     print("\n[SERVER] Phase 7: Setting up routes...", flush=True)

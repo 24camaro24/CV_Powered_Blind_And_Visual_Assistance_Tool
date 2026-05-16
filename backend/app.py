@@ -1,11 +1,5 @@
 import os
 
-# CRITICAL: Disable CUDA BEFORE ANY imports that might use torch
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['CUDA_HOME'] = ''
-os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
-
 # Now safe to import everything else
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -31,7 +25,7 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
 # Initialize pipeline
 print("Initializing Navigation Pipeline...")
-pipeline = NavigationPipeline(device='cpu')
+pipeline = NavigationPipeline(device='auto')
 print("Pipeline ready!")
 
 def allowed_file(filename):

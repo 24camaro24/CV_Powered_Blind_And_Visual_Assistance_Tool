@@ -1,12 +1,6 @@
 import os
 import sys
 
-# CRITICAL: Disable CUDA BEFORE ANY imports that might use torch
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['CUDA_HOME'] = ''
-os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
-
 # Disable HuggingFace model downloads if cache not available
 os.environ['HF_HUB_OFFLINE'] = '0'  # Allow online but will fallback to cache
 os.environ['TRANSFORMERS_OFFLINE'] = '0'  # Allow online but will fallback to cache
@@ -47,14 +41,14 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 print("="*60)
 print("Initializing Navigation Pipeline...")
 try:
-    pipeline = NavigationPipeline(device='cpu')
+    pipeline = NavigationPipeline(device='auto')
     print("✅ Pipeline initialized successfully!")
-    print("   All models loaded on CPU")
+    print(f"   Active device: {pipeline.get_device_str()}")
 except RuntimeError as e:
     if "CUDA" in str(e):
         print(f"[WARNING] CUDA error during initialization: {e}")
-        print("[INFO] Attempting to continue with CPU-only mode...")
-        pipeline = NavigationPipeline(device='cpu')
+        print("[INFO] Retrying with automatic device selection...")
+        pipeline = NavigationPipeline(device='auto')
     else:
         print(f"[ERROR] Failed to initialize pipeline: {e}")
         raise
@@ -201,7 +195,7 @@ def process():
     except RuntimeError as e:
         if "CUDA" in str(e) or "cuda" in str(e):
             print(f"[API FATAL] Unhandled CUDA error: {e}")
-            return jsonify({'error': f'CUDA processing error: Please ensure models are on CPU'}), 500
+            return jsonify({'error': 'Model processing error on the selected device'}), 500
         else:
             raise
     except Exception as e:
@@ -409,7 +403,7 @@ def handle_runtime_error(error):
     print(f"[GLOBAL] RuntimeError caught: {error_str}")
     if "CUDA" in error_str or "cuda" in error_str:
         print("[GLOBAL] CUDA error detected - returning graceful error response")
-        return jsonify({'error': 'Model processing error. Ensure models are configured for CPU-only mode.'}), 500
+        return jsonify({'error': 'Model processing error on the selected device.'}), 500
     return jsonify({'error': error_str}), 500
 
 if __name__ == '__main__':
