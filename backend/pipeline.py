@@ -2,6 +2,7 @@ import os
 import logging
 import ctypes
 import importlib.util
+import json
 
 # Allow HuggingFace downloads by default, while letting callers override.
 os.environ.setdefault('HF_HUB_OFFLINE', '0')
@@ -14,6 +15,8 @@ import cv2
 from PIL import Image
 import tempfile
 import base64
+import time
+import io
 from pathlib import Path
 import signal
 import sys
@@ -361,6 +364,702 @@ class FewShotMatcher:
         }
 
 
+class ONNXFewShotLocalizer:
+    """ONNX example-image object localizer used by the separate Find by Example flow."""
+
+    def __init__(self, model_dir, device='cpu'):
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "onnxruntime is not installed. Install backend requirements before using Find by Example."
+            ) from exc
+
+        self.ort = ort
+        self.model_dir = Path(model_dir)
+        self.device = str(device)
+        self.siamese_meta = self._load_meta("siamese_meta.json")
+        self.localizer_meta = self._load_meta("localizer_meta.json")
+        learned_threshold = float(
+            self.siamese_meta.get("threshold", {}).get("learned_threshold", 0.5)
+        )
+        default_similarity_threshold = min(learned_threshold, 0.30)
+        self.siamese_threshold = float(
+            os.getenv("EXAMPLE_SIMILARITY_THRESHOLD", str(default_similarity_threshold))
+        )
+        self.abstain_threshold = float(
+            self.localizer_meta.get("model_config", {}).get("abstain_threshold", 0.5)
+        )
+        self.min_localizer_score = float(os.getenv("EXAMPLE_MIN_LOCALIZER_SCORE", "0.0"))
+        self.min_combined_confidence = float(os.getenv("EXAMPLE_MIN_COMBINED_CONFIDENCE", "0.0"))
+        self.max_query_proposals = int(os.getenv("EXAMPLE_MAX_QUERY_PROPOSALS", "20"))
+        self.max_localizer_candidates = int(os.getenv("EXAMPLE_MAX_LOCALIZER_CANDIDATES", "12"))
+        self.segment_support_images = os.getenv("EXAMPLE_SEGMENT_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.support_segment_min_fg = float(os.getenv("EXAMPLE_SUPPORT_MIN_FG_RATIO", "0.06"))
+        self.rmbg_mask_threshold = float(os.getenv("EXAMPLE_RMBG_MASK_THRESHOLD", "0.5"))
+        self.rmbg_size = int(os.getenv("EXAMPLE_RMBG_SIZE", "1024"))
+        self.debug_save_proposals = os.getenv("EXAMPLE_DEBUG_SAVE_PROPOSALS", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.debug_root = Path(os.getenv("EXAMPLE_DEBUG_DIR", str(self.model_dir.parent / "backend" / "debug" / "example_proposals")))
+        self.use_rembg_support = os.getenv("EXAMPLE_USE_REMBG", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.localizer_on_cpu = os.getenv("EXAMPLE_LOCALIZER_ON_CPU", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.rembg_remove = None
+        logger.info(
+            "ONNX few-shot config: similarity_threshold=%.4f segment_support=%s min_fg_ratio=%.4f",
+            self.siamese_threshold,
+            self.segment_support_images,
+            self.support_segment_min_fg,
+        )
+        if self.use_rembg_support:
+            try:
+                from rembg import remove as rembg_remove
+                self.rembg_remove = rembg_remove
+                logger.info("Example support segmentation: rembg (U-2-Net) enabled")
+            except Exception as exc:
+                logger.warning("rembg unavailable for support segmentation: %s", exc)
+        self.providers = self._select_providers()
+        self.localizer_providers = ["CPUExecutionProvider"] if self.localizer_on_cpu else list(self.providers)
+        self.rmbg_session = self._create_optional_rmbg_session()
+        self.siamese_session = self._create_session(self.model_dir / "siamese.onnx")
+        self.localizer_session = self._create_session(
+            self.model_dir / "localizer.onnx",
+            providers=self.localizer_providers,
+        )
+        logger.info(
+            "ONNX example chain ready: RMBG=%s, Siamese=loaded, Localizer=loaded (%s)",
+            "loaded" if self.rmbg_session is not None else "disabled (fallback preprocessing)",
+            ",".join(self.localizer_providers),
+        )
+
+    def _load_meta(self, filename):
+        path = self.model_dir / filename
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _select_providers(self):
+        available = self.ort.get_available_providers()
+        providers = []
+        if self.device.startswith("cuda") and "CUDAExecutionProvider" in available:
+            providers.append("CUDAExecutionProvider")
+        if "CPUExecutionProvider" in available:
+            providers.append("CPUExecutionProvider")
+        return providers or available
+
+    def _create_session(self, path, providers=None):
+        if not path.exists():
+            raise FileNotFoundError(f"Missing ONNX model: {path}")
+
+        session_options = self.ort.SessionOptions()
+        session_options.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        session_options.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+        selected_providers = list(providers) if providers is not None else list(self.providers)
+
+        try:
+            return self.ort.InferenceSession(
+                str(path),
+                sess_options=session_options,
+                providers=selected_providers,
+            )
+        except Exception as exc:
+            if "CUDAExecutionProvider" in selected_providers:
+                logger.warning(
+                    "ONNX CUDA provider failed for %s: %s. Retrying on CPU.",
+                    path.name,
+                    exc,
+                )
+                selected_providers = ["CPUExecutionProvider"]
+                if providers is None:
+                    self.providers = ["CPUExecutionProvider"]
+                return self.ort.InferenceSession(
+                    str(path),
+                    sess_options=session_options,
+                    providers=selected_providers,
+                )
+            raise
+
+    def _create_optional_rmbg_session(self):
+        configured_path = os.getenv("EXAMPLE_RMBG_PATH", "").strip()
+        if configured_path:
+            rmbg_path = Path(configured_path)
+        else:
+            rmbg_path = self.model_dir / "rmbg.onnx"
+
+        if not rmbg_path.exists():
+            logger.info("ONNX RMBG model not found at %s; using fallback support preprocessing", rmbg_path)
+            return None
+
+        try:
+            return self._create_session(rmbg_path)
+        except Exception as exc:
+            logger.warning("ONNX RMBG load failed (%s); using fallback support preprocessing", exc)
+            return None
+
+    def _is_cuda_oom_error(self, exc):
+        text = str(exc).lower()
+        return "cuda failure 2: out of memory" in text or "cuda out of memory" in text
+
+    def _switch_example_sessions_to_cpu(self):
+        if self.providers == ["CPUExecutionProvider"] and self.localizer_providers == ["CPUExecutionProvider"]:
+            return
+
+        logger.warning("ONNX CUDA OOM detected, switching example sessions to CPU and retrying once")
+        self.providers = ["CPUExecutionProvider"]
+        self.localizer_providers = ["CPUExecutionProvider"]
+        self.rmbg_session = self._create_optional_rmbg_session()
+        self.siamese_session = self._create_session(self.model_dir / "siamese.onnx")
+        self.localizer_session = self._create_session(
+            self.model_dir / "localizer.onnx",
+            providers=self.localizer_providers,
+        )
+
+    def _run_session_with_oom_fallback(self, session_attr, inputs, stage_name):
+        session = getattr(self, session_attr)
+        try:
+            return session.run(None, inputs)
+        except Exception as exc:
+            if self._is_cuda_oom_error(exc):
+                logger.warning("ONNX %s stage hit CUDA OOM: %s", stage_name, exc)
+                self._switch_example_sessions_to_cpu()
+                session = getattr(self, session_attr)
+                return session.run(None, inputs)
+            raise
+
+    def localize(self, support_images, query_image, debug_label="example"):
+        if not support_images:
+            raise ValueError("At least one support image is required")
+
+        query_pil = self._to_pil(query_image)
+        query_w, query_h = query_pil.size
+        raw_support_images = [self._to_pil(s).copy() for s in support_images]
+        if self.segment_support_images:
+            support_images = self._prepare_support_images(raw_support_images)
+        else:
+            support_images = raw_support_images
+
+        logger.info(
+            "Example support preprocessing: enabled=%s supports=%d",
+            self.segment_support_images,
+            len(support_images),
+        )
+
+        debug_run_dir = self._create_debug_run_dir(debug_label) if self.debug_save_proposals else None
+        if debug_run_dir is not None:
+            self._save_support_debug_images(debug_run_dir, raw_support_images, prefix="support_raw")
+            self._save_support_debug_images(debug_run_dir, support_images, prefix="support_preprocessed")
+            query_path = debug_run_dir / "query_image.png"
+            query_pil.save(query_path)
+            logger.info("Example debug query image saved: %s", query_path)
+
+        k_max = int(self.siamese_meta.get("k_max", 10))
+        if len(support_images) > k_max:
+            logger.info("Example support count exceeds k_max=%d; truncating to first %d images", k_max, k_max)
+            support_images = support_images[:k_max]
+
+        siamese_inputs, _ = self._build_inputs(support_images, query_pil, self.siamese_meta)
+        existence_outputs = self._run_session_with_oom_fallback(
+            "siamese_session",
+            siamese_inputs,
+            "siamese",
+        )
+        best_existence = float(np.asarray(existence_outputs[0]).reshape(-1)[0])
+        logger.info(
+            "Example siamese existence_prob=%.4f threshold=%.4f",
+            best_existence,
+            self.siamese_threshold,
+        )
+        if best_existence < self.siamese_threshold:
+            return {
+                "found": False,
+                "reason": "similarity_below_threshold",
+                "existence_prob": best_existence,
+                "existence_threshold": self.siamese_threshold,
+                "proposal_count": 1,
+                "debug_dir": str(debug_run_dir) if debug_run_dir is not None else None,
+            }
+
+        localizer_inputs, query_transform = self._build_inputs(
+            support_images,
+            query_pil,
+            self.localizer_meta,
+        )
+        raw_outputs = self._run_session_with_oom_fallback(
+            "localizer_session",
+            localizer_inputs,
+            "localizer",
+        )
+        output_names = [output.name for output in self.localizer_session.get_outputs()]
+        outputs = dict(zip(output_names, raw_outputs))
+
+        best_box = np.asarray(outputs.get("best_box", raw_outputs[0])).reshape(-1)[:4]
+        best_score = float(np.asarray(outputs.get("best_score", raw_outputs[1])).reshape(-1)[0])
+        bg_default = np.array([0.0], dtype=np.float32)
+        best_bg_prob = float(np.asarray(outputs.get("bg_prob", bg_default)).reshape(-1)[0])
+        best_bbox = self._box_to_native_xyxy(best_box, query_transform)
+        best_combined = float(min(best_existence, best_score))
+        logger.info(
+            "Example localizer output existence=%.4f localizer=%.4f bg=%.4f combined=%.4f bbox=%s",
+            best_existence,
+            best_score,
+            best_bg_prob,
+            best_combined,
+            best_bbox,
+        )
+
+        if best_bg_prob >= self.abstain_threshold:
+            return {
+                "found": False,
+                "reason": "localizer_abstained",
+                "existence_prob": best_existence,
+                "existence_threshold": self.siamese_threshold,
+                "localizer_score": best_score,
+                "bg_prob": best_bg_prob,
+                "abstain_threshold": self.abstain_threshold,
+                "combined_confidence": best_combined,
+                "proposal_count": 1,
+                "debug_dir": str(debug_run_dir) if debug_run_dir is not None else None,
+            }
+
+        if best_score < self.min_localizer_score:
+            return {
+                "found": False,
+                "reason": "localizer_low_score",
+                "existence_prob": best_existence,
+                "existence_threshold": self.siamese_threshold,
+                "localizer_score": best_score,
+                "localizer_min_score": self.min_localizer_score,
+                "combined_confidence": best_combined,
+                "combined_min_confidence": self.min_combined_confidence,
+                "bg_prob": best_bg_prob,
+                "abstain_threshold": self.abstain_threshold,
+                "proposal_count": 1,
+                "debug_dir": str(debug_run_dir) if debug_run_dir is not None else None,
+            }
+
+        if best_combined < self.min_combined_confidence:
+            return {
+                "found": False,
+                "reason": "combined_low_confidence",
+                "existence_prob": best_existence,
+                "existence_threshold": self.siamese_threshold,
+                "localizer_score": best_score,
+                "localizer_min_score": self.min_localizer_score,
+                "combined_confidence": best_combined,
+                "combined_min_confidence": self.min_combined_confidence,
+                "bg_prob": best_bg_prob,
+                "abstain_threshold": self.abstain_threshold,
+                "proposal_count": 1,
+                "debug_dir": str(debug_run_dir) if debug_run_dir is not None else None,
+            }
+
+        return {
+            "found": True,
+            "bbox": best_bbox,
+            "existence_prob": best_existence,
+            "existence_threshold": self.siamese_threshold,
+            "localizer_score": best_score,
+            "localizer_min_score": self.min_localizer_score,
+            "combined_confidence": best_combined,
+            "combined_min_confidence": self.min_combined_confidence,
+            "bg_prob": best_bg_prob,
+            "abstain_threshold": self.abstain_threshold,
+            "proposal_count": 1,
+            "chosen_proposal_index": 0,
+            "chosen_proposal_rect": [0, 0, query_w, query_h],
+            "providers": self.providers,
+            "debug_dir": str(debug_run_dir) if debug_run_dir is not None else None,
+        }
+
+    def _generate_query_proposals(self, query_image):
+        pil_image = self._to_pil(query_image)
+        img_rgb = np.asarray(pil_image)
+        h, w = img_rgb.shape[:2]
+        min_area_ratio = 0.01
+        max_area_ratio = 0.90
+        min_area = int(min_area_ratio * h * w)
+        max_area = int(max_area_ratio * h * w)
+
+        proposals = [{
+            "index": 0,
+            "rect": [0, 0, w, h],
+            "offset": (0, 0),
+            "image": pil_image,
+        }]
+
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 70, 180)
+        edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=2)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_rects = []
+        for contour in contours:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            area = cw * ch
+            if area < min_area or area > max_area:
+                continue
+            if cw < 24 or ch < 24:
+                continue
+            contour_rects.append((x, y, cw, ch, area))
+
+        contour_rects.sort(key=lambda item: item[4], reverse=True)
+        next_index = 1
+        for x, y, cw, ch, _ in contour_rects:
+            if len(proposals) >= self.max_query_proposals:
+                break
+
+            margin_x = max(8, int(0.12 * cw))
+            margin_y = max(8, int(0.12 * ch))
+            x1 = max(0, x - margin_x)
+            y1 = max(0, y - margin_y)
+            x2 = min(w, x + cw + margin_x)
+            y2 = min(h, y + ch + margin_y)
+            rect = [x1, y1, x2, y2]
+
+            duplicate = any(self._rect_iou(rect, existing["rect"]) > 0.72 for existing in proposals)
+            if duplicate:
+                continue
+
+            crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+            proposals.append({
+                "index": next_index,
+                "rect": rect,
+                "offset": (x1, y1),
+                "image": crop,
+            })
+            next_index += 1
+
+        # Add deterministic grid proposals so salient misses do not hide valid objects.
+        grid_rects = []
+        for cols, rows in ((2, 2), (3, 2)):
+            tile_w = max(1, w // cols)
+            tile_h = max(1, h // rows)
+            for row in range(rows):
+                for col in range(cols):
+                    x1 = col * tile_w
+                    y1 = row * tile_h
+                    x2 = w if col == cols - 1 else (col + 1) * tile_w
+                    y2 = h if row == rows - 1 else (row + 1) * tile_h
+                    grid_rects.append([x1, y1, x2, y2])
+
+        # Center-focused proposals at different scales.
+        for scale in (0.70, 0.50):
+            cw = int(w * scale)
+            ch = int(h * scale)
+            x1 = max(0, (w - cw) // 2)
+            y1 = max(0, (h - ch) // 2)
+            x2 = min(w, x1 + cw)
+            y2 = min(h, y1 + ch)
+            grid_rects.append([x1, y1, x2, y2])
+
+        for rect in grid_rects:
+            if len(proposals) >= self.max_query_proposals:
+                break
+            duplicate = any(self._rect_iou(rect, existing["rect"]) > 0.72 for existing in proposals)
+            if duplicate:
+                continue
+            x1, y1, x2, y2 = rect
+            crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+            proposals.append({
+                "index": next_index,
+                "rect": rect,
+                "offset": (x1, y1),
+                "image": crop,
+            })
+            next_index += 1
+
+        return proposals
+
+    def _rect_iou(self, rect_a, rect_b):
+        ax1, ay1, ax2, ay2 = rect_a
+        bx1, by1, bx2, by2 = rect_b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter = inter_w * inter_h
+        if inter == 0:
+            return 0.0
+
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _create_debug_run_dir(self, debug_label):
+        safe_label = "".join(ch for ch in str(debug_label) if ch.isalnum() or ch in ("_", "-")).strip()
+        if not safe_label:
+            safe_label = "example"
+        run_id = f"{int(time.time() * 1000)}_{safe_label}"
+        run_dir = self.debug_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Example debug artifacts directory: %s", run_dir)
+        return run_dir
+
+    def _prepare_support_images(self, support_images):
+        processed = []
+        for idx, support in enumerate(support_images):
+            pil_img = self._to_pil(support)
+            if self.rmbg_session is not None:
+                processed_img, fg_ratio = self._segment_support_foreground_onnx(pil_img)
+                if fg_ratio > 0.0:
+                    logger.info(
+                        "Support idx=%d RMBG crop foreground ratio=%.4f (accepted)",
+                        idx,
+                        fg_ratio,
+                    )
+                    processed.append(processed_img)
+                else:
+                    logger.info(
+                        "Support idx=%d RMBG crop produced no foreground; fallback to raw image",
+                        idx,
+                    )
+                    processed.append(pil_img)
+                continue
+
+            if self.rembg_remove is not None:
+                segmented_img, fg_ratio = self._segment_support_foreground_rembg(pil_img)
+            else:
+                segmented_img, fg_ratio = self._segment_support_foreground(pil_img)
+
+            if fg_ratio >= self.support_segment_min_fg:
+                logger.info("Support idx=%d fallback segmentation ratio=%.4f (accepted)", idx, fg_ratio)
+                processed.append(segmented_img)
+            else:
+                logger.info(
+                    "Support idx=%d fallback segmentation ratio=%.4f below min=%.4f (raw kept)",
+                    idx,
+                    fg_ratio,
+                    self.support_segment_min_fg,
+                )
+                processed.append(pil_img)
+        return processed
+
+    def _segment_support_foreground_rembg(self, pil_img):
+        img_rgba = pil_img.convert("RGBA")
+        try:
+            removed = self.rembg_remove(img_rgba)
+        except Exception as exc:
+            logger.warning("rembg support segmentation failed: %s", exc)
+            return pil_img, 0.0
+
+        if isinstance(removed, bytes):
+            try:
+                removed = Image.open(io.BytesIO(removed))
+            except Exception as exc:
+                logger.warning("rembg returned unreadable bytes: %s", exc)
+                return pil_img, 0.0
+
+        removed = removed.convert("RGBA")
+        arr = np.asarray(removed)
+        alpha = arr[:, :, 3]
+        fg_mask = np.where(alpha > 16, 255, 0).astype(np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        fg_ratio = float(np.count_nonzero(fg_mask)) / float(fg_mask.size)
+
+        rgb = np.asarray(pil_img.convert("RGB")).copy()
+        rgb[fg_mask == 0] = (114, 114, 114)
+        return Image.fromarray(rgb).convert("RGB"), fg_ratio
+
+    def _segment_support_foreground_onnx(self, pil_img):
+        img_rgb = np.asarray(pil_img.convert("RGB"))
+        h, w = img_rgb.shape[:2]
+        if h < 8 or w < 8:
+            return pil_img, 0.0
+
+        resized = cv2.resize(img_rgb, (self.rmbg_size, self.rmbg_size), interpolation=cv2.INTER_LINEAR)
+        input_tensor = resized.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        input_tensor = (input_tensor - mean) / std
+        input_tensor = np.transpose(input_tensor, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
+
+        try:
+            input_name = self.rmbg_session.get_inputs()[0].name
+            output = self.rmbg_session.run(None, {input_name: input_tensor})[0]
+        except Exception as exc:
+            logger.warning("ONNX RMBG inference failed: %s", exc)
+            return pil_img, 0.0
+
+        mask = np.asarray(output).reshape(self.rmbg_size, self.rmbg_size)
+        foreground = mask > self.rmbg_mask_threshold
+        if not np.any(foreground):
+            return pil_img, 0.0
+
+        ys, xs = np.where(foreground)
+        mask_x1, mask_x2 = int(xs.min()), int(xs.max())
+        mask_y1, mask_y2 = int(ys.min()), int(ys.max())
+
+        x1 = int(np.floor(mask_x1 * w / self.rmbg_size))
+        y1 = int(np.floor(mask_y1 * h / self.rmbg_size))
+        x2 = int(np.ceil((mask_x2 + 1) * w / self.rmbg_size))
+        y2 = int(np.ceil((mask_y2 + 1) * h / self.rmbg_size))
+
+        x1 = int(np.clip(x1, 0, max(0, w - 1)))
+        y1 = int(np.clip(y1, 0, max(0, h - 1)))
+        x2 = int(np.clip(x2, x1 + 1, w))
+        y2 = int(np.clip(y2, y1 + 1, h))
+
+        fg_ratio = float(np.count_nonzero(foreground)) / float(foreground.size)
+        cropped = pil_img.crop((x1, y1, x2, y2)).convert("RGB")
+        return cropped, fg_ratio
+
+    def _segment_support_foreground(self, pil_img):
+        img_rgb = np.asarray(pil_img.convert("RGB"))
+        h, w = img_rgb.shape[:2]
+        if h < 8 or w < 8:
+            return pil_img, 0.0
+
+        mask = np.zeros((h, w), np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        margin_x = max(2, int(0.05 * w))
+        margin_y = max(2, int(0.05 * h))
+        rect = (margin_x, margin_y, max(1, w - 2 * margin_x), max(1, h - 2 * margin_y))
+
+        try:
+            cv2.grabCut(img_rgb, mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
+        except Exception as exc:
+            logger.warning("Support segmentation grabCut failed: %s", exc)
+            return pil_img, 0.0
+
+        fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        fg_ratio = float(np.count_nonzero(fg_mask)) / float(fg_mask.size)
+
+        segmented = img_rgb.copy()
+        segmented[fg_mask == 0] = (114, 114, 114)
+        segmented_pil = Image.fromarray(segmented).convert("RGB")
+        return segmented_pil, fg_ratio
+
+    def _save_support_debug_images(self, run_dir, support_images, prefix="support"):
+        for idx, support in enumerate(support_images):
+            try:
+                img = self._to_pil(support)
+                save_path = run_dir / f"{prefix}_{idx:02d}.png"
+                img.save(save_path)
+            except Exception as exc:
+                logger.warning("Could not save support debug image idx=%d: %s", idx, exc)
+
+    def _save_single_proposal_crop(self, run_dir, proposal, existence_prob):
+        try:
+            save_path = run_dir / (
+                f"proposal_{proposal['index']:02d}_"
+                f"exist_{int(round(existence_prob * 1000)):04d}.png"
+            )
+            proposal["image"].save(save_path)
+        except Exception as exc:
+            logger.warning("Could not save proposal crop idx=%d: %s", proposal.get("index", -1), exc)
+
+    def _save_proposal_overview(self, run_dir, query_pil, proposals):
+        try:
+            vis = cv2.cvtColor(np.asarray(query_pil), cv2.COLOR_RGB2BGR)
+            for proposal in proposals:
+                x1, y1, x2, y2 = proposal["rect"]
+                idx = proposal["index"]
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 255), 2)
+                cv2.putText(
+                    vis,
+                    str(idx),
+                    (x1 + 4, max(14, y1 + 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                )
+            cv2.imwrite(str(run_dir / "query_proposals_overview.png"), vis)
+        except Exception as exc:
+            logger.warning("Could not save proposal overview: %s", exc)
+
+    def _build_inputs(self, support_images, query_image, meta):
+        img_size = int(meta.get("img_size", meta["inputs"]["query_img"]["shape"][-1]))
+        k_max = int(meta.get("k_max", meta["inputs"]["support_imgs"]["shape"][1]))
+
+        support_batch = np.zeros((1, k_max, 3, img_size, img_size), dtype=np.float32)
+        support_mask = np.zeros((1, k_max), dtype=np.float32)
+
+        for index, image in enumerate(support_images[:k_max]):
+            support_batch[0, index] = self._letterbox(image, meta)[0]
+            support_mask[0, index] = 1.0
+
+        query_tensor, query_transform = self._letterbox(query_image, meta)
+        query_tensor = query_tensor[np.newaxis, ...].astype(np.float32)
+
+        return {
+            "support_imgs": support_batch,
+            "support_mask": support_mask,
+            "query_img": query_tensor,
+        }, query_transform
+
+    def _letterbox(self, image, meta):
+        img_size = int(meta.get("img_size", meta["inputs"]["query_img"]["shape"][-1]))
+        pad_color = tuple(meta.get("preprocessing", {}).get("letterbox", {}).get(
+            "pad_color_rgb",
+            [114, 114, 114],
+        ))
+        pil_image = self._to_pil(image)
+        orig_w, orig_h = pil_image.size
+        scale = img_size / max(orig_w, orig_h)
+        new_w = max(1, int(round(orig_w * scale)))
+        new_h = max(1, int(round(orig_h * scale)))
+        pad_left = (img_size - new_w) // 2
+        pad_top = (img_size - new_h) // 2
+
+        resized = pil_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        canvas = Image.new("RGB", (img_size, img_size), pad_color)
+        canvas.paste(resized, (pad_left, pad_top))
+
+        array = np.asarray(canvas, dtype=np.float32) / 255.0
+        tensor = np.transpose(array, (2, 0, 1)).astype(np.float32)
+        transform = {
+            "img_size": img_size,
+            "orig_w": orig_w,
+            "orig_h": orig_h,
+            "scale": scale,
+            "pad_left": pad_left,
+            "pad_top": pad_top,
+        }
+        return tensor, transform
+
+    def _to_pil(self, image):
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        if isinstance(image, (str, Path)):
+            return Image.open(image).convert("RGB")
+        if isinstance(image, np.ndarray):
+            if image.dtype != np.uint8:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+            return Image.fromarray(image).convert("RGB")
+        raise TypeError(f"Unsupported image type: {type(image).__name__}")
+
+    def _box_to_native_xyxy(self, box, transform):
+        img_size = transform["img_size"]
+        scale = transform["scale"]
+        pad_left = transform["pad_left"]
+        pad_top = transform["pad_top"]
+        orig_w = transform["orig_w"]
+        orig_h = transform["orig_h"]
+
+        cx, cy, width, height = [float(value) for value in box]
+        cx_lb = cx * img_size
+        cy_lb = cy * img_size
+        width_lb = max(1.0, width * img_size)
+        height_lb = max(1.0, height * img_size)
+
+        x1 = (cx_lb - width_lb / 2 - pad_left) / scale
+        y1 = (cy_lb - height_lb / 2 - pad_top) / scale
+        x2 = (cx_lb + width_lb / 2 - pad_left) / scale
+        y2 = (cy_lb + height_lb / 2 - pad_top) / scale
+
+        x1 = int(np.clip(round(x1), 0, orig_w - 1))
+        y1 = int(np.clip(round(y1), 0, orig_h - 1))
+        x2 = int(np.clip(round(x2), x1 + 1, orig_w))
+        y2 = int(np.clip(round(y2), y1 + 1, orig_h))
+        return [x1, y1, x2, y2]
+
+
 class NavigationPipeline:
     DEFAULT_DEPTH_MODEL = "depth-anything/DA3METRIC-LARGE"
     DEFAULT_WHISPER_MODEL = "small"
@@ -381,6 +1080,7 @@ class NavigationPipeline:
         self.instr_model = None
         self.tts = None
         self.few_shot_matcher = None
+        self.example_localizer = None
         self.model_status = {}
         self._dll_directory_handles = []
 
@@ -433,6 +1133,11 @@ class NavigationPipeline:
             self._load_whisper_model,
             timeout_secs=60,
         )
+        self.example_localizer = self._try_load_model(
+            "ONNX FewShotLocalizer",
+            self._load_example_localizer,
+            timeout_secs=120,
+        )
 
         instruction_result = self._try_load_model(
             "Flan-T5",
@@ -456,16 +1161,21 @@ class NavigationPipeline:
             if result is None:
                 raise TimeoutError(f"{label} did not finish loading within {timeout_secs}s")
             self.model_status[label] = "loaded"
-            logger.info("%s ready on %s", label, self._model_device_label(label))
+            logger.info("%s ready on %s", label, self._model_device_label(label, result))
             return result
         except Exception as exc:
             self.model_status[label] = f"failed: {exc}"
             logger.error("%s failed to load: %s", label, exc)
             return None
 
-    def _model_device_label(self, label):
+    def _model_device_label(self, label, loaded_result=None):
         if label == "Whisper" and self.whisper_device:
             return self.whisper_device
+        if label == "ONNX FewShotLocalizer":
+            source = loaded_result if loaded_result is not None else self.example_localizer
+            providers = getattr(source, "providers", None) or []
+            providers_text = ",".join(providers) if providers else "unknown"
+            return f"onnx[{providers_text}]"
         return self.device
 
     def _load_grounding_model(self):
@@ -582,6 +1292,32 @@ class NavigationPipeline:
             self.few_shot_matcher = None
             self.model_status["FewShotMatcher"] = f"failed: {exc}"
             logger.error("FewShotMatcher failed to initialize: %s", exc)
+
+    def _load_example_localizer(self):
+        model_dir = Path(__file__).parent.parent / "few_shot"
+        localizer = ONNXFewShotLocalizer(model_dir=model_dir, device=self.device)
+        available = localizer.ort.get_available_providers()
+        selected = localizer.providers
+        logger.info("ONNX providers available: %s", available)
+        logger.info("ONNX providers selected: %s", selected)
+        if self.torch_device.type == "cuda" and "CUDAExecutionProvider" not in selected:
+            logger.warning(
+                "Torch device is CUDA but ONNX is not using CUDAExecutionProvider; "
+                "example flow will run on CPU."
+            )
+        return localizer
+
+    def _get_example_localizer(self):
+        if self.example_localizer is None:
+            self.example_localizer = self._try_load_model(
+                "ONNX FewShotLocalizer",
+                self._load_example_localizer,
+                timeout_secs=60,
+            )
+        if self.example_localizer is None:
+            status = self.model_status.get("ONNX FewShotLocalizer", "not loaded")
+            raise RuntimeError(f"ONNX FewShotLocalizer is unavailable: {status}")
+        return self.example_localizer
 
     def _log_model_summary(self):
         summary = ", ".join(f"{name}={status}" for name, status in self.model_status.items())
@@ -1044,6 +1780,203 @@ class NavigationPipeline:
             # Fall back to DINO scores
         
         return enhanced_logits
+
+    def process_image_by_example(self, image_path, support_image_paths, target_label="example object"):
+        """
+        Locate an object in a scene using ONNX few-shot support images, then estimate navigation.
+        This is intentionally separate from the text/GroundingDINO process_image flow.
+        """
+        import time
+        start_time = time.time()
+
+        try:
+            self._require_models(("depth_model", "Depth Anything 3"))
+            localizer = self._get_example_localizer()
+
+            if not support_image_paths:
+                return {
+                    "success": False,
+                    "error": "At least one example image is required",
+                }
+
+            scene_image = Image.open(image_path).convert("RGB")
+            img_np = np.asarray(scene_image)
+            support_images = [
+                Image.open(path).convert("RGB")
+                for path in support_image_paths
+            ]
+
+            localization = localizer.localize(support_images, scene_image, debug_label=target_label)
+            if not localization.get("found"):
+                reason = localization.get("reason", "not_found")
+                reason_messages = {
+                    "similarity_below_threshold": "Example object not found (support/query similarity too low)",
+                    "localizer_abstained": "Example object not found (localizer abstained)",
+                    "localizer_low_score": "Example match is too weak (localizer confidence too low)",
+                    "combined_low_confidence": "Example match is too weak (combined confidence too low)",
+                    "no_query_proposals": "No candidate regions were found in the query image",
+                    "no_localizer_candidates": "No valid candidate regions passed to localizer",
+                }
+                return {
+                    "success": False,
+                    "error": reason_messages.get(reason, f"Example object not found ({reason})"),
+                    "target": target_label,
+                    "few_shot": localization,
+                }
+
+            bbox = localization["bbox"]
+            result = self._navigation_from_example_bbox(
+                img_np=img_np,
+                bbox=bbox,
+                target=target_label,
+                localization=localization,
+                processing_time=time.time() - start_time,
+            )
+            return result
+
+        except Exception as exc:
+            logger.error("Example-image processing failed: %s", exc)
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Example processing error: {str(exc)}",
+            }
+
+    def _navigation_from_example_bbox(self, img_np, bbox, target, localization, processing_time):
+        h, w = img_np.shape[:2]
+        x1, y1, x2, y2 = [int(value) for value in bbox]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+
+        object_width = max(1, x2 - x1)
+
+        try:
+            depth_map = self.estimate_depth(img_np)
+            if depth_map.shape[:2] != (h, w):
+                depth_map = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_CUBIC)
+        except Exception as depth_error:
+            logger.error("Depth Anything 3 estimation failed for example flow: %s", depth_error)
+            return {
+                "success": False,
+                "error": f"Depth estimation error: {str(depth_error)}",
+                "few_shot": localization,
+            }
+
+        depth_region = depth_map[y1:y2, x1:x2]
+        if depth_region.size == 0:
+            return {
+                "success": False,
+                "error": "Localized box is empty after clipping",
+                "few_shot": localization,
+            }
+
+        obj_depth = float(np.nanmean(depth_region))
+        if not np.isfinite(obj_depth):
+            return {
+                "success": False,
+                "error": "Depth inside localized box is invalid",
+                "few_shot": localization,
+            }
+
+        steps, meters = self.improved_depth_to_steps(obj_depth, w, object_width)
+
+        img_center = w / 2
+        obj_center = (x1 + x2) / 2
+        fov = 60
+        angle = (obj_center - img_center) / w * fov
+
+        confidence = float(
+            min(
+                localization.get("existence_prob", 0.0),
+                localization.get("localizer_score", 0.0),
+            )
+        )
+        visualization = self._draw_example_visualization(
+            img_np=img_np,
+            bbox=(x1, y1, x2, y2),
+            target=target,
+            meters=meters,
+            steps=steps,
+            angle=angle,
+            confidence=confidence,
+        )
+
+        return {
+            "success": True,
+            "source": "example",
+            "target": target,
+            "angle": float(angle),
+            "steps": float(steps),
+            "distance_meters": float(meters),
+            "depth": obj_depth,
+            "bbox": [x1, y1, x2, y2],
+            "visualization": visualization,
+            "confidence": confidence,
+            "processing_time": float(processing_time),
+            "surfaces": [],
+            "few_shot": localization,
+        }
+
+    def _draw_example_visualization(self, img_np, bbox, target, meters, steps, angle, confidence):
+        x1, y1, x2, y2 = bbox
+        h, w = img_np.shape[:2]
+        vis = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        box_color = (0, 190, 255)
+        center_color = (60, 220, 80)
+        text_color = (255, 255, 255)
+        panel_color = (28, 70, 82)
+
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), box_color, -1)
+        vis = cv2.addWeighted(vis, 0.82, overlay, 0.18, 0)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, 4)
+
+        target_cx = (x1 + x2) // 2
+        target_cy = (y1 + y2) // 2
+        camera_cx = w // 2
+        camera_cy = h // 2
+        cv2.circle(vis, (target_cx, target_cy), 8, center_color, -1)
+        cv2.circle(vis, (camera_cx, camera_cy), 6, (255, 255, 255), -1)
+        cv2.arrowedLine(vis, (camera_cx, camera_cy), (target_cx, target_cy), box_color, 3, tipLength=0.25)
+
+        panel_h = min(118, max(86, h // 5))
+        panel = vis.copy()
+        cv2.rectangle(panel, (0, 0), (w, panel_h), panel_color, -1)
+        vis = cv2.addWeighted(vis, 0.68, panel, 0.32, 0)
+
+        label = str(target or "example object").upper()[:28]
+        direction = "STRAIGHT"
+        if angle > 5:
+            direction = "RIGHT"
+        elif angle < -5:
+            direction = "LEFT"
+
+        cv2.putText(vis, f"EXAMPLE: {label}", (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+        cv2.putText(
+            vis,
+            f"{meters:.1f}m | {int(round(steps))} steps | {direction}",
+            (18, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (160, 255, 220),
+            2,
+        )
+        cv2.putText(
+            vis,
+            f"match {confidence * 100:.0f}%",
+            (18, min(panel_h - 16, 104)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (230, 230, 230),
+            1,
+        )
+
+        _, buffer = cv2.imencode(".png", vis)
+        return base64.b64encode(buffer).decode()
     
     def process_image(self, image_path, target):
         """

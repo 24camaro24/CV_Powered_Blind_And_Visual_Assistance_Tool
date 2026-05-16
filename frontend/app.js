@@ -3,6 +3,7 @@ const API_BASE_URL = '/api';
 class NavigationApp {
     constructor() {
         this.uploadedFilename = null;
+        this.supportFiles = [];
         this.isUsingCamera = false;
         this.isRecording = false;
         this.isProcessing = false;
@@ -66,6 +67,27 @@ class NavigationApp {
                     <button class="btn-primary primary-action" id="processBtn" type="button">Get Guidance</button>
                 </div>
 
+                <section class="section example-section" aria-labelledby="exampleTitle">
+                    <h2 id="exampleTitle">Find by Example</h2>
+
+                    <label class="field-label" for="exampleLabelInput">Object label</label>
+                    <input type="text" id="exampleLabelInput" class="target-input" placeholder="my keys">
+
+                    <div class="upload-box" id="supportUploadBox" role="button" tabindex="0" aria-label="Upload example images">
+                        <p class="upload-text">Drop example images or browse</p>
+                        <p class="upload-hint">Up to 10 object images</p>
+                        <input type="file" id="supportInput" accept="image/*" multiple>
+                        <div id="supportPreviewContainer" class="support-preview-grid"></div>
+                    </div>
+
+                    <p id="supportStatus" class="status-line">No example images selected</p>
+
+                    <div class="source-actions">
+                        <button class="btn-primary" id="exampleProcessBtn" type="button">Find by Example</button>
+                        <button class="btn-secondary" id="clearSupportBtn" type="button">Clear Examples</button>
+                    </div>
+                </section>
+
                 <div id="resultsSection" aria-live="polite"></div>
             </main>
         `;
@@ -80,6 +102,10 @@ class NavigationApp {
         const clearTargetBtn = this.el('clearTargetBtn');
         const processBtn = this.el('processBtn');
         const targetInput = this.el('targetInput');
+        const supportUploadBox = this.el('supportUploadBox');
+        const supportInput = this.el('supportInput');
+        const clearSupportBtn = this.el('clearSupportBtn');
+        const exampleProcessBtn = this.el('exampleProcessBtn');
 
         cameraBtn.addEventListener('click', () => this.toggleCamera());
         clearSourceBtn.addEventListener('click', () => this.clearSource());
@@ -87,6 +113,8 @@ class NavigationApp {
         clearTargetBtn.addEventListener('click', () => this.clearTarget());
         processBtn.addEventListener('click', () => this.processNavigation());
         targetInput.addEventListener('input', () => this.clearResults());
+        clearSupportBtn.addEventListener('click', () => this.clearSupportExamples());
+        exampleProcessBtn.addEventListener('click', () => this.processExampleNavigation());
 
         uploadBox.addEventListener('click', () => imageInput.click());
         uploadBox.addEventListener('keydown', (event) => {
@@ -117,6 +145,31 @@ class NavigationApp {
             if (file) {
                 this.handleImageUpload(file);
             }
+        });
+
+        supportUploadBox.addEventListener('click', () => supportInput.click());
+        supportUploadBox.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                supportInput.click();
+            }
+        });
+
+        supportUploadBox.addEventListener('dragover', (event) => {
+            event.preventDefault();
+            supportUploadBox.classList.add('active');
+        });
+
+        supportUploadBox.addEventListener('dragleave', () => supportUploadBox.classList.remove('active'));
+
+        supportUploadBox.addEventListener('drop', (event) => {
+            event.preventDefault();
+            supportUploadBox.classList.remove('active');
+            this.handleSupportUpload(event.dataTransfer.files);
+        });
+
+        supportInput.addEventListener('change', (event) => {
+            this.handleSupportUpload(event.target.files);
         });
     }
 
@@ -256,6 +309,92 @@ class NavigationApp {
         this.el('previewContainer').innerHTML = '';
         this.setSourceStatus('No image selected');
         this.clearResults();
+    }
+
+    handleSupportUpload(fileList) {
+        const files = Array.from(fileList || []);
+        if (files.length === 0) {
+            return;
+        }
+
+        try {
+            const nextFiles = [...this.supportFiles];
+            for (const file of files) {
+                this.validateImageFile(file);
+                nextFiles.push(file);
+            }
+
+            if (nextFiles.length > 10) {
+                throw new Error('At most 10 example images are supported.');
+            }
+
+            this.supportFiles = nextFiles;
+            this.el('supportInput').value = '';
+            this.renderSupportPreviews();
+            this.setSupportStatus(`${this.supportFiles.length} example image${this.supportFiles.length === 1 ? '' : 's'} selected`);
+            this.clearResults();
+        } catch (error) {
+            this.showError(error.message);
+        }
+    }
+
+    validateImageFile(file) {
+        if (!file || !file.type.startsWith('image/')) {
+            throw new Error('Please choose image files only.');
+        }
+
+        if (file.size > 50 * 1024 * 1024) {
+            throw new Error('Example image is too large. Maximum size is 50 MB.');
+        }
+    }
+
+    renderSupportPreviews() {
+        const container = this.el('supportPreviewContainer');
+        if (!container) {
+            return;
+        }
+
+        if (this.supportFiles.length === 0) {
+            container.innerHTML = '';
+            return;
+        }
+
+        Promise.all(this.supportFiles.map((file, index) => this.readFileAsDataURL(file).then((src) => ({
+            src,
+            index,
+            name: file.name
+        })))).then((items) => {
+            container.innerHTML = items.map((item) => `
+                <div class="support-preview-item">
+                    <img src="${item.src}" alt="${this.escapeHTML(item.name)}">
+                    <span>${item.index + 1}</span>
+                </div>
+            `).join('');
+        });
+    }
+
+    readFileAsDataURL(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.addEventListener('load', () => resolve(reader.result));
+            reader.addEventListener('error', () => reject(new Error(`Could not read ${file.name}`)));
+            reader.readAsDataURL(file);
+        });
+    }
+
+    clearSupportExamples() {
+        this.supportFiles = [];
+        this.el('supportInput').value = '';
+        this.el('supportPreviewContainer').innerHTML = '';
+        this.setSupportStatus('No example images selected');
+        this.clearResults();
+    }
+
+    setSupportStatus(message) {
+        const status = this.el('supportStatus');
+        if (status) {
+            status.textContent = message;
+        }
     }
 
     setSourceStatus(message) {
@@ -429,6 +568,53 @@ class NavigationApp {
         }
     }
 
+    async processExampleNavigation() {
+        if (this.isProcessing) {
+            return;
+        }
+
+        if (this.supportFiles.length === 0) {
+            this.showError('Add at least one example image.');
+            return;
+        }
+
+        try {
+            this.setProcessing(true);
+            let filename = this.uploadedFilename;
+
+            if (this.isUsingCamera) {
+                const frame = await this.captureCameraFrame();
+                const upload = await this.uploadImage(frame, 'camera-frame.jpg', 'Uploading camera frame...');
+                filename = upload.filename;
+            }
+
+            if (!filename) {
+                throw new Error('Choose a scene image or turn on the camera first.');
+            }
+
+            const label = this.el('exampleLabelInput').value.trim() || 'example object';
+            const formData = new FormData();
+            formData.append('filename', filename);
+            formData.append('target', label);
+            this.supportFiles.forEach((file) => {
+                formData.append('support_images', file, file.name);
+            });
+
+            this.showLoading('Finding by example...');
+            const data = await this.requestJSON(`${API_BASE_URL}/process-example`, {
+                method: 'POST',
+                body: formData
+            });
+
+            this.displayResults(data);
+            this.generateInstruction(data);
+        } catch (error) {
+            this.showError(error.message);
+        } finally {
+            this.setProcessing(false);
+        }
+    }
+
     captureCameraFrame() {
         const video = this.el('cameraFeed');
 
@@ -546,6 +732,13 @@ class NavigationApp {
                     <span class="result-value">${this.formatSeconds(processingTime)}</span>
                 </div>
 
+                ${data.few_shot ? `
+                    <div class="result-item">
+                        <span class="result-label">Example match</span>
+                        <span class="result-value">${this.formatFewShot(data.few_shot)}</span>
+                    </div>
+                ` : ''}
+
                 ${data.visualization ? `
                     <div class="visualization">
                         <h3>Visual Analysis</h3>
@@ -640,11 +833,16 @@ class NavigationApp {
 
     setProcessing(isProcessing) {
         this.isProcessing = isProcessing;
-        const button = this.el('processBtn');
-        if (button) {
-            button.disabled = isProcessing;
-            button.textContent = isProcessing ? 'Working...' : 'Get Guidance';
-        }
+        [
+            ['processBtn', 'Get Guidance'],
+            ['exampleProcessBtn', 'Find by Example']
+        ].forEach(([id, idleText]) => {
+            const button = this.el(id);
+            if (button) {
+                button.disabled = isProcessing;
+                button.textContent = isProcessing ? 'Working...' : idleText;
+            }
+        });
     }
 
     showLoading(message) {
@@ -697,6 +895,25 @@ class NavigationApp {
                     : name;
             })
             .join(', ');
+    }
+
+    formatFewShot(fewShot) {
+        const existence = this.asNumber(fewShot.existence_prob, null);
+        const localizer = this.asNumber(fewShot.localizer_score, null);
+        const bgProb = this.asNumber(fewShot.bg_prob, null);
+        const parts = [];
+
+        if (Number.isFinite(existence)) {
+            parts.push(`similarity ${Math.round(existence * 100)}%`);
+        }
+        if (Number.isFinite(localizer)) {
+            parts.push(`box ${Math.round(localizer * 100)}%`);
+        }
+        if (Number.isFinite(bgProb)) {
+            parts.push(`background ${Math.round(bgProb * 100)}%`);
+        }
+
+        return parts.length > 0 ? parts.join(', ') : 'Available';
     }
 
     asNumber(value, fallback) {

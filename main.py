@@ -204,6 +204,119 @@ def process():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/process-example', methods=['POST'])
+def process_example():
+    """Process a scene using ONNX support/example images as the target."""
+    support_paths = []
+    try:
+        filename = secure_filename(request.form.get('filename', '').strip())
+        target = request.form.get('target', '').strip() or 'example object'
+        support_files = request.files.getlist('support_images')
+
+        # Debugging: log incoming form data for example-based search
+        try:
+            print(f"[DEBUG] /api/process-example received filename='{filename}' target='{target}' support_files={[f.filename for f in support_files]}")
+        except Exception:
+            # Fallback in case of unexpected types
+            print(f"[DEBUG] /api/process-example received filename and target (unable to list support filenames)")
+
+        if not filename:
+            return jsonify({'error': 'Missing scene filename'}), 400
+
+        if not support_files:
+            return jsonify({'error': 'At least one example image is required'}), 400
+
+        if len(support_files) > 10:
+            return jsonify({'error': 'At most 10 example images are supported'}), 400
+
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'Scene image file not found'}), 404
+
+        timestamp = int(time.time() * 1000)
+        for index, file in enumerate(support_files):
+            if file.filename == '':
+                continue
+            if not allowed_file(file.filename):
+                return jsonify({'error': 'Invalid example image type. Allowed: ' + ', '.join(ALLOWED_EXTENSIONS)}), 400
+
+            safe_name = secure_filename(file.filename)
+            support_path = os.path.join(
+                app.config['UPLOAD_FOLDER'],
+                f"support_{timestamp}_{index}_{safe_name}",
+            )
+            file.save(support_path)
+            support_paths.append(support_path)
+
+        if not support_paths:
+            return jsonify({'error': 'No valid example images were provided'}), 400
+
+        start_time = time.time()
+        result = pipeline.process_image_by_example(filepath, support_paths, target)
+        elapsed = time.time() - start_time
+
+        if not result['success']:
+            print(f"[API] process_image_by_example failed: {result['error']}")
+            few_shot = result.get('few_shot') or {}
+            if few_shot.get('debug_dir'):
+                print(f"[DEBUG] Example debug artifacts: {few_shot['debug_dir']}")
+            return jsonify(result), 400
+
+        result['processing_time'] = result.get('processing_time', elapsed)
+
+        try:
+            instruction_result = pipeline.generate_instruction(
+                result['target'],
+                result['steps'],
+                result['angle'],
+                result['distance_meters'],
+                result.get('confidence', 0.85),
+                result.get('depth', 0),
+                result.get('surfaces', None)
+            )
+
+            result['navigation_guidance'] = {
+                'detailed_text': instruction_result['detailed'],
+                'conversational_text': instruction_result['conversational'],
+                'summary': instruction_result['summary']
+            }
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "cuda" in str(e):
+                print(f"[API ERROR] CUDA error in example instruction generation: {e}")
+                result['navigation_guidance'] = {
+                    'detailed_text': f'Navigation to {result["target"]}',
+                    'conversational_text': f'Target found at {result["distance_meters"]:.1f} meters',
+                    'summary': {
+                        'target': result['target'],
+                        'distance_m': round(result['distance_meters'], 2),
+                        'steps': int(result['steps']),
+                        'direction': 'ahead',
+                        'angle_degrees': round(result['angle'], 1),
+                        'confidence_percent': round(result.get('confidence', 0.85) * 100, 1),
+                        'depth_m': round(result.get('depth', 0), 3),
+                        'on_surface': None
+                    }
+                }
+            else:
+                raise
+
+        return jsonify(result), 200
+
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "cuda" in str(e):
+            print(f"[API FATAL] Unhandled CUDA error in example flow: {e}")
+            return jsonify({'error': 'Example model processing error on the selected device'}), 500
+        raise
+    except Exception as e:
+        print(f"[API ERROR] process-example {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        for support_path in support_paths:
+            if os.path.exists(support_path):
+                os.remove(support_path)
+
 @app.route('/api/transcribe', methods=['POST'])
 def transcribe_audio():
     """Transcribe audio to text"""
