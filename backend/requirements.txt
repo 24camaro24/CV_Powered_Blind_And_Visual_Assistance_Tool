@@ -1,0 +1,12 @@
+Flask>=2.3.0
+flask-cors>=4.0.0
+Werkzeug>=2.3.0
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0.0
+Pillow>=10.0.0
+transformers==4.25.1
+faster-whisper>=0.9.0
+TTS>=0.22.0
+groundingdino-py>=0.4.0

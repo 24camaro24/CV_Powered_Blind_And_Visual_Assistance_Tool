@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/uploads:/app/backend/uploads
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  frontend:
+    image: python:3.10-slim
+    working_dir: /app/frontend
+    command: python -m http.server 8000 --bind 0.0.0.0
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      - backend
+    restart: unless-stopped
