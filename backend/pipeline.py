@@ -1,5 +1,7 @@
 import os
 import logging
+import ctypes
+import importlib.util
 
 # Allow HuggingFace downloads by default, while letting callers override.
 os.environ.setdefault('HF_HUB_OFFLINE', '0')
@@ -373,11 +375,14 @@ class NavigationPipeline:
         self.depth_model = None
         self.depth_processor = None
         self.whisper_model = None
+        self.whisper_device = None
+        self.whisper_compute_type = None
         self.instr_tokenizer = None
         self.instr_model = None
         self.tts = None
         self.few_shot_matcher = None
         self.model_status = {}
+        self._dll_directory_handles = []
 
         self.depth_model_name = os.getenv("DEPTH_ANYTHING_MODEL", self.DEFAULT_DEPTH_MODEL)
         self.whisper_model_name = os.getenv("WHISPER_MODEL", self.DEFAULT_WHISPER_MODEL)
@@ -451,12 +456,17 @@ class NavigationPipeline:
             if result is None:
                 raise TimeoutError(f"{label} did not finish loading within {timeout_secs}s")
             self.model_status[label] = "loaded"
-            logger.info("%s ready on %s", label, self.device)
+            logger.info("%s ready on %s", label, self._model_device_label(label))
             return result
         except Exception as exc:
             self.model_status[label] = f"failed: {exc}"
             logger.error("%s failed to load: %s", label, exc)
             return None
+
+    def _model_device_label(self, label):
+        if label == "Whisper" and self.whisper_device:
+            return self.whisper_device
+        return self.device
 
     def _load_grounding_model(self):
         base_dir = Path(__file__).parent.parent
@@ -476,9 +486,74 @@ class NavigationPipeline:
         return model
 
     def _load_whisper_model(self):
-        whisper_device = "cuda" if self.torch_device.type == "cuda" else "cpu"
-        compute_type = "float16" if whisper_device == "cuda" else "int8"
+        whisper_device = self._preferred_whisper_device()
+
+        if whisper_device == "cuda" and os.name == "nt":
+            self._add_windows_nvidia_dll_directories()
+            if not self._windows_dll_available("cudnn_ops_infer64_8.dll"):
+                logger.warning(
+                    "Whisper CUDA runtime is missing cudnn_ops_infer64_8.dll; "
+                    "using CPU for Whisper while keeping vision models on %s",
+                    self.device,
+                )
+                whisper_device = "cpu"
+
+        return self._create_whisper_model(whisper_device)
+
+    def _preferred_whisper_device(self):
+        requested = os.getenv("WHISPER_DEVICE", "auto").strip().lower()
+
+        if requested in ("cuda", "gpu"):
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if requested == "cpu":
+            return "cpu"
+
+        return "cuda" if self.torch_device.type == "cuda" else "cpu"
+
+    def _create_whisper_model(self, whisper_device):
+        compute_type = os.getenv("WHISPER_COMPUTE_TYPE")
+        if not compute_type:
+            compute_type = "float16" if whisper_device == "cuda" else "int8"
+
+        logger.info(
+            "Loading Whisper model=%s device=%s compute_type=%s",
+            self.whisper_model_name,
+            whisper_device,
+            compute_type,
+        )
+        self.whisper_device = whisper_device
+        self.whisper_compute_type = compute_type
         return WhisperModel(self.whisper_model_name, device=whisper_device, compute_type=compute_type)
+
+    def _add_windows_nvidia_dll_directories(self):
+        if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+            return
+
+        for module_name in ("nvidia.cudnn", "nvidia.cublas"):
+            try:
+                spec = importlib.util.find_spec(module_name)
+            except ModuleNotFoundError:
+                spec = None
+
+            if not spec or not spec.submodule_search_locations:
+                continue
+
+            for location in spec.submodule_search_locations:
+                root = Path(location)
+                for dll_dir in (root / "bin", root / "lib"):
+                    if dll_dir.exists():
+                        try:
+                            self._dll_directory_handles.append(os.add_dll_directory(str(dll_dir)))
+                            logger.info("Added DLL directory for %s: %s", module_name, dll_dir)
+                        except OSError as exc:
+                            logger.warning("Could not add DLL directory %s: %s", dll_dir, exc)
+
+    def _windows_dll_available(self, dll_name):
+        try:
+            ctypes.WinDLL(dll_name)
+            return True
+        except OSError:
+            return False
 
     def _load_instruction_model(self):
         tokenizer = AutoTokenizer.from_pretrained(self.instruction_model_name)
@@ -520,9 +595,37 @@ class NavigationPipeline:
     def transcribe_audio(self, audio_path):
         """Transcribe audio to text using Whisper"""
         self._require_models(("whisper_model", "Whisper"))
+        try:
+            return self._transcribe_with_whisper(audio_path)
+        except Exception as exc:
+            if not self._is_whisper_cuda_runtime_error(exc):
+                raise
+
+            logger.warning(
+                "Whisper CUDA transcription failed: %s. Reloading Whisper on CPU and retrying.",
+                exc,
+            )
+            self.whisper_model = self._create_whisper_model("cpu")
+            self.model_status["Whisper"] = "loaded on cpu after CUDA fallback"
+            return self._transcribe_with_whisper(audio_path)
+
+    def _transcribe_with_whisper(self, audio_path):
         segments, info = self.whisper_model.transcribe(audio_path)
         text = " ".join([segment.text for segment in segments])
         return text
+
+    def _is_whisper_cuda_runtime_error(self, exc):
+        if self.whisper_device != "cuda":
+            return False
+
+        message = str(exc).lower()
+        return any(token in message for token in (
+            "cuda",
+            "cudnn",
+            "cublas",
+            "could not locate",
+            "dll",
+        ))
     
     def extract_target_from_text(self, text):
         """Extract target object using simple, reliable heuristic (NO LLM)"""
