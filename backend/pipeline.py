@@ -213,6 +213,34 @@ class FewShotMatcher:
         # Put model in eval mode
         for param in self.siamese.parameters():
             param.requires_grad = False
+
+    def _prepare_image_tensor(self, image_input):
+        """Convert an image-like input to a normalized BCHW tensor."""
+        if isinstance(image_input, np.ndarray):
+            image_tensor = torch.from_numpy(image_input).float()
+            if image_tensor.dim() == 3:
+                image_tensor = image_tensor.permute(2, 0, 1)
+        elif isinstance(image_input, Image.Image):
+            image_tensor = torch.from_numpy(np.array(image_input)).float()
+            if image_tensor.dim() == 3:
+                image_tensor = image_tensor.permute(2, 0, 1)
+        elif isinstance(image_input, torch.Tensor):
+            image_tensor = image_input.float()
+        else:
+            raise TypeError(f"Unsupported image input type: {type(image_input)!r}")
+
+        if image_tensor.max() > 1.0:
+            image_tensor = image_tensor / 255.0
+
+        if image_tensor.dim() == 3:
+            image_tensor = image_tensor.unsqueeze(0)
+
+        return image_tensor
+
+    def _compute_embedding(self, image_input):
+        image_tensor = self._prepare_image_tensor(image_input)
+        with torch.no_grad():
+            return self.siamese(image_tensor.to(self.device))
     
     def add_reference(self, object_name, image_tensor):
         """
@@ -225,30 +253,7 @@ class FewShotMatcher:
         Returns:
             embedding: The computed embedding for this reference
         """
-        # Convert to tensor if needed
-        if isinstance(image_tensor, np.ndarray):
-            image_tensor = torch.from_numpy(image_tensor).float()
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
-        elif isinstance(image_tensor, Image.Image):
-            image_tensor = torch.from_numpy(np.array(image_tensor)).float()
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
-        elif isinstance(image_tensor, torch.Tensor):
-            if image_tensor.dtype != torch.float32:
-                image_tensor = image_tensor.float()
-        
-        # Normalize to [0, 1]
-        if image_tensor.max() > 1.0:
-            image_tensor = image_tensor / 255.0
-        
-        # Add batch dimension
-        if image_tensor.dim() == 3:
-            image_tensor = image_tensor.unsqueeze(0)
-        
-        # Compute embedding
-        with torch.no_grad():
-            embedding = self.siamese(image_tensor.to(self.device))
+        embedding = self._compute_embedding(image_tensor)
         
         # Store in database
         if object_name not in self.reference_db:
@@ -278,36 +283,15 @@ class FewShotMatcher:
         if len(self.reference_db) == 0:
             return []
         
-        # Convert input to tensor
-        if isinstance(image_region, np.ndarray):
-            image_tensor = torch.from_numpy(image_region).float()
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
-        elif isinstance(image_region, Image.Image):
-            image_tensor = torch.from_numpy(np.array(image_region)).float()
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
-        elif isinstance(image_region, torch.Tensor):
-            image_tensor = image_region.float()
-        else:
+        try:
+            query_embedding = self._compute_embedding(image_region)
+        except TypeError:
             return []
-        
-        # Normalize
-        if image_tensor.max() > 1.0:
-            image_tensor = image_tensor / 255.0
-        
-        # Add batch dimension
-        if image_tensor.dim() == 3:
-            image_tensor = image_tensor.unsqueeze(0)
-        
-        # Compute embedding
-        with torch.no_grad():
-            query_embedding = self.siamese(image_tensor.to(self.device))
         
         # Compare against all references
         matched_objects = []
         for object_name, data in self.reference_db.items():
-            embeddings = torch.cat(data['embeddings'], dim=0)  # (num_refs, embedding_dim)
+            embeddings = torch.cat(data['embeddings'], dim=0).to(self.device)  # (num_refs, embedding_dim)
             
             # Compute cosine similarity with all references
             similarities = torch.nn.functional.cosine_similarity(
@@ -329,6 +313,25 @@ class FewShotMatcher:
         matched_objects = sorted(matched_objects, key=lambda x: x['similarity'], reverse=True)
         
         return matched_objects
+
+    def match_region_for_object(self, image_region, object_name):
+        """Match an image region against one specific stored reference object."""
+        if object_name not in self.reference_db:
+            return None
+
+        try:
+            query_embedding = self._compute_embedding(image_region)
+        except TypeError:
+            return None
+
+        embeddings = torch.cat(self.reference_db[object_name]['embeddings'], dim=0).to(self.device)
+        similarities = torch.nn.functional.cosine_similarity(query_embedding, embeddings)
+        max_sim = similarities.max().item()
+        return {
+            'object_name': object_name,
+            'similarity': float(max_sim),
+            'num_references': self.reference_db[object_name]['count']
+        }
     
     def get_best_match(self, image_region, similarity_threshold=0.65):
         """
@@ -366,6 +369,9 @@ class NavigationPipeline:
     DEFAULT_WHISPER_MODEL = "small"
     DEFAULT_INSTRUCTION_MODEL = "google/flan-t5-small"
     DEFAULT_TTS_MODEL = "tts_models/en/ljspeech/tacotron2-DDC"
+    REFERENCE_SIMILARITY_WEIGHT = 0.6
+    DINO_CONFIDENCE_WEIGHT = 0.4
+    REFERENCE_RERANK_MAX_GAP = 0.08
 
     def __init__(self, device='auto'):
         self.requested_device = device or 'auto'
@@ -381,6 +387,7 @@ class NavigationPipeline:
         self.instr_model = None
         self.tts = None
         self.few_shot_matcher = None
+        self.reference_catalog = {}
         self.model_status = {}
         self._dll_directory_handles = []
 
@@ -586,6 +593,139 @@ class NavigationPipeline:
     def _log_model_summary(self):
         summary = ", ".join(f"{name}={status}" for name, status in self.model_status.items())
         logger.info("Model load summary: %s", summary)
+
+    def normalize_reference_name(self, name):
+        normalized = " ".join(str(name or "").strip().lower().split())
+        return normalized
+
+    def has_reference(self, name):
+        normalized = self.normalize_reference_name(name)
+        return bool(
+            self.few_shot_matcher
+            and normalized
+            and normalized in self.few_shot_matcher.reference_db
+        )
+
+    def register_reference_image(self, name, image_path, display_name=None):
+        self._require_models(("few_shot_matcher", "FewShotMatcher"))
+        normalized_name = self.normalize_reference_name(name)
+        if not normalized_name:
+            raise ValueError("Reference name cannot be empty")
+
+        image = Image.open(image_path).convert("RGB")
+        self.few_shot_matcher.clear_references(normalized_name)
+        self.few_shot_matcher.add_reference(normalized_name, image)
+        self.reference_catalog[normalized_name] = {
+            'name': display_name or name,
+            'normalized_name': normalized_name,
+            'image_path': str(image_path),
+        }
+        return self.reference_catalog[normalized_name]
+
+    def remove_reference_image(self, name):
+        normalized_name = self.normalize_reference_name(name)
+        if self.few_shot_matcher:
+            self.few_shot_matcher.clear_references(normalized_name)
+        self.reference_catalog.pop(normalized_name, None)
+
+    def list_reference_images(self):
+        references = []
+        if not self.few_shot_matcher:
+            return references
+
+        db_info = self.few_shot_matcher.get_database_info()
+        for normalized_name, info in db_info.items():
+            catalog_entry = self.reference_catalog.get(normalized_name, {})
+            references.append({
+                'name': catalog_entry.get('name', normalized_name),
+                'normalized_name': normalized_name,
+                'image_path': catalog_entry.get('image_path'),
+                'count': info.get('count', 0),
+            })
+        return sorted(references, key=lambda item: item['name'])
+
+    def rerank_boxes_with_reference(self, image_np, target_name, dino_boxes, dino_logits):
+        """Rerank candidate detections using the saved reference image for the target."""
+        if (
+            not self.few_shot_matcher
+            or not target_name
+            or not self.has_reference(target_name)
+            or len(dino_boxes) == 0
+        ):
+            return dino_logits, []
+
+        if torch.is_tensor(dino_logits):
+            if len(dino_logits) < 2:
+                logger.info(
+                    "Skipping reference reranking for '%s': only %s DINO candidate available",
+                    target_name,
+                    len(dino_logits),
+                )
+                return dino_logits, []
+            top_values = torch.topk(dino_logits, k=min(2, len(dino_logits))).values
+            top_gap = float((top_values[0] - top_values[1]).item())
+        else:
+            if len(dino_logits) < 2:
+                logger.info(
+                    "Skipping reference reranking for '%s': only %s DINO candidate available",
+                    target_name,
+                    len(dino_logits),
+                )
+                return dino_logits, []
+            sorted_logits = sorted((float(logit) for logit in dino_logits), reverse=True)
+            top_gap = sorted_logits[0] - sorted_logits[1]
+
+        if top_gap > self.REFERENCE_RERANK_MAX_GAP:
+            logger.info(
+                "Skipping reference reranking for '%s': top DINO gap %.4f exceeds threshold %.4f",
+                target_name,
+                top_gap,
+                self.REFERENCE_RERANK_MAX_GAP,
+            )
+            return dino_logits, []
+
+        normalized_name = self.normalize_reference_name(target_name)
+        h, w = image_np.shape[:2]
+        reranked_logits = dino_logits.clone() if torch.is_tensor(dino_logits) else list(dino_logits)
+        reference_scores = []
+
+        for idx, box in enumerate(dino_boxes):
+            pixel_box = box * torch.tensor([w, h, w, h])
+            cx, cy, bw, bh = pixel_box
+            x1 = max(0, int(cx - bw / 2))
+            y1 = max(0, int(cy - bh / 2))
+            x2 = min(w, int(cx + bw / 2))
+            y2 = min(h, int(cy + bh / 2))
+
+            region = image_np[y1:y2, x1:x2]
+            if region.size == 0:
+                reference_scores.append({'candidate_index': idx, 'similarity': 0.0})
+                continue
+
+            match = self.few_shot_matcher.match_region_for_object(region, normalized_name)
+            similarity = float(match['similarity']) if match else 0.0
+            dino_conf = float(dino_logits[idx].item()) if torch.is_tensor(dino_logits) else float(dino_logits[idx])
+            combined_score = (
+                (self.DINO_CONFIDENCE_WEIGHT * dino_conf) +
+                (self.REFERENCE_SIMILARITY_WEIGHT * similarity)
+            )
+
+            if torch.is_tensor(reranked_logits):
+                reranked_logits[idx] = combined_score
+            else:
+                reranked_logits[idx] = combined_score
+
+            reference_scores.append({
+                'candidate_index': idx,
+                'similarity': similarity,
+                'dino_confidence': dino_conf,
+                'combined_score': float(combined_score),
+                'bbox': [x1, y1, x2, y2],
+            })
+
+        reference_scores.sort(key=lambda item: item['combined_score'], reverse=True)
+        logger.info("Reference reranking for '%s': %s", normalized_name, reference_scores[:3])
+        return reranked_logits, reference_scores
 
     def _require_models(self, *requirements):
         missing = [label for attr, label in requirements if getattr(self, attr, None) is None]
@@ -1045,7 +1185,7 @@ class NavigationPipeline:
         
         return enhanced_logits
     
-    def process_image(self, image_path, target):
+    def process_image(self, image_path, target, reference_name=None):
         """
         Process image and estimate navigation parameters
         Returns dict with success status and results
@@ -1100,12 +1240,44 @@ class NavigationPipeline:
                     'error': f'Target "{target}" not detected in image'
                 }
             
-            # Activate Siamese network: boost confidence using few-shot matching if available
-            logits = self.hybrid_detect_and_match(img_np, image_tensor, target, boxes, logits)
-            logger.info("Post-Siamese confidence=%s", float(logits[0].item()) if torch.is_tensor(logits[0]) else float(logits[0]))
+            active_reference_name = reference_name if self.has_reference(reference_name) else None
+            reference_scores = []
+            if active_reference_name:
+                logits, reference_scores = self.rerank_boxes_with_reference(
+                    img_np,
+                    active_reference_name,
+                    boxes,
+                    logits,
+                )
+            if logits is None or len(logits) == 0:
+                return {
+                    'success': False,
+                    'error': f'Target "{target}" not detected reliably in image'
+                }
+
+            if torch.is_tensor(logits):
+                best_idx = int(torch.argmax(logits).item())
+                best_confidence = float(logits[best_idx].item())
+            else:
+                best_idx = max(range(len(logits)), key=lambda idx: float(logits[idx]))
+                best_confidence = float(logits[best_idx])
+
+            best_reference_score = None
+            if reference_scores:
+                best_reference_score = next(
+                    (item for item in reference_scores if item['candidate_index'] == best_idx),
+                    None
+                )
+
+            logger.info(
+                "Selected detection index=%s confidence=%s reference=%s",
+                best_idx,
+                best_confidence,
+                best_reference_score,
+            )
             
-            # Get bounding box
-            box = boxes[0] * torch.tensor([w, h, w, h])
+            # Get the highest-confidence bounding box
+            box = boxes[best_idx] * torch.tensor([w, h, w, h])
             cx, cy, bw, bh = box
             x1 = int(cx - bw/2)
             y1 = int(cy - bh/2)
@@ -1269,9 +1441,11 @@ class NavigationPipeline:
                 'depth': float(obj_depth),
                 'bbox': [x1, y1, x2, y2],
                 'visualization': img_base64,
-                'confidence': float(logits[0].item() if logits is not None else 0),
+                'confidence': float(best_confidence),
                 'processing_time': float(processing_time),
-                'surfaces': surfaces  # New: spatial relationship info
+                'surfaces': surfaces,  # New: spatial relationship info
+                'reference_name': active_reference_name,
+                'reference_score': best_reference_score,
             }
         
         except Exception as e:
