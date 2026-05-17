@@ -117,6 +117,102 @@ def process():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/process-example', methods=['POST'])
+def process_example():
+    """Route example flow:
+    - target only -> GroundingDINO
+    - examples only -> OWLv2 image-guided
+    - both -> OWLv2 + GroundingDINO hybrid
+    """
+    support_paths = []
+    try:
+        filename = secure_filename(request.form.get('filename', '').strip())
+        target = request.form.get('target', '').strip()
+        support_files = request.files.getlist('support_images')
+
+        if not filename:
+            return jsonify({'error': 'Missing scene filename'}), 400
+
+        if len(support_files) > 10:
+            return jsonify({'error': 'At most 10 example images are supported'}), 400
+
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'Scene image file not found'}), 404
+
+        timestamp = int(time.time() * 1000)
+        for index, file in enumerate(support_files):
+            if file.filename == '':
+                continue
+            if not allowed_file(file.filename):
+                return jsonify({'error': 'Invalid example image type. Allowed: ' + ', '.join(ALLOWED_EXTENSIONS)}), 400
+
+            safe_name = secure_filename(file.filename)
+            support_path = os.path.join(
+                app.config['UPLOAD_FOLDER'],
+                f"support_{timestamp}_{index}_{safe_name}",
+            )
+            file.save(support_path)
+            support_paths.append(support_path)
+
+        has_target = bool(target)
+        has_examples = len(support_paths) > 0
+        if not has_target and not has_examples:
+            return jsonify({'error': 'Provide a target text/voice input or at least one example image'}), 400
+
+        start_time = time.time()
+        if has_target and has_examples:
+            mode = "hybrid_owl_dino"
+            result = pipeline.process_image_hybrid_owl_dino(filepath, support_paths, target)
+        elif has_target:
+            mode = "grounding_dino"
+            result = pipeline.process_image(filepath, target)
+        else:
+            mode = "owlv2_examples"
+            result = pipeline.process_image_with_owl_examples(filepath, support_paths, target_label="example object")
+        elapsed = time.time() - start_time
+
+        if not result['success']:
+            return jsonify({'error': result['error']}), 400
+
+        result['processing_time'] = result.get('processing_time', elapsed)
+        result['few_shot'] = {
+            'mode': mode,
+            'object_name': target if has_target else 'example object',
+            'added_references': len(support_paths),
+            'total_references': len(support_paths),
+            'similarity_score': result.get('confidence'),
+        }
+
+        instruction_result = pipeline.generate_instruction(
+            result['target'],
+            result['steps'],
+            result['angle'],
+            result['distance_meters'],
+            result.get('confidence', 0.85),
+            result.get('depth', 0),
+            surfaces=result.get('surfaces', [])
+        )
+
+        result['navigation_guidance'] = {
+            'detailed_text': instruction_result['detailed'],
+            'conversational_text': instruction_result['conversational'],
+            'summary': instruction_result['summary']
+        }
+
+        return jsonify(result), 200
+
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "cuda" in str(e):
+            return jsonify({'error': 'Hybrid example processing error on the selected device'}), 500
+        raise
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        for support_path in support_paths:
+            if os.path.exists(support_path):
+                os.remove(support_path)
+
 @app.route('/api/transcribe', methods=['POST'])
 def transcribe_audio():
     """Transcribe audio to text"""

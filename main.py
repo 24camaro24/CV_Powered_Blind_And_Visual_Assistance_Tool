@@ -206,25 +206,19 @@ def process():
 
 @app.route('/api/process-example', methods=['POST'])
 def process_example():
-    """Process a scene using ONNX support/example images as the target."""
+    """Route example flow:
+    - target only -> GroundingDINO
+    - examples only -> OWLv2 image-guided
+    - both -> OWLv2 + GroundingDINO hybrid
+    """
     support_paths = []
     try:
         filename = secure_filename(request.form.get('filename', '').strip())
-        target = request.form.get('target', '').strip() or 'example object'
+        target = request.form.get('target', '').strip()
         support_files = request.files.getlist('support_images')
-
-        # Debugging: log incoming form data for example-based search
-        try:
-            print(f"[DEBUG] /api/process-example received filename='{filename}' target='{target}' support_files={[f.filename for f in support_files]}")
-        except Exception:
-            # Fallback in case of unexpected types
-            print(f"[DEBUG] /api/process-example received filename and target (unable to list support filenames)")
 
         if not filename:
             return jsonify({'error': 'Missing scene filename'}), 400
-
-        if not support_files:
-            return jsonify({'error': 'At least one example image is required'}), 400
 
         if len(support_files) > 10:
             return jsonify({'error': 'At most 10 example images are supported'}), 400
@@ -248,21 +242,35 @@ def process_example():
             file.save(support_path)
             support_paths.append(support_path)
 
-        if not support_paths:
-            return jsonify({'error': 'No valid example images were provided'}), 400
+        has_target = bool(target)
+        has_examples = len(support_paths) > 0
+        if not has_target and not has_examples:
+            return jsonify({'error': 'Provide a target text/voice input or at least one example image'}), 400
 
         start_time = time.time()
-        result = pipeline.process_image_by_example(filepath, support_paths, target)
+        if has_target and has_examples:
+            mode = "hybrid_owl_dino"
+            result = pipeline.process_image_hybrid_owl_dino(filepath, support_paths, target)
+        elif has_target:
+            mode = "grounding_dino"
+            result = pipeline.process_image(filepath, target)
+        else:
+            mode = "owlv2_examples"
+            result = pipeline.process_image_with_owl_examples(filepath, support_paths, target_label="example object")
         elapsed = time.time() - start_time
 
         if not result['success']:
-            print(f"[API] process_image_by_example failed: {result['error']}")
-            few_shot = result.get('few_shot') or {}
-            if few_shot.get('debug_dir'):
-                print(f"[DEBUG] Example debug artifacts: {few_shot['debug_dir']}")
-            return jsonify(result), 400
+            print(f"[API] process-example failed mode={mode}: {result['error']}")
+            return jsonify({'error': result['error']}), 400
 
         result['processing_time'] = result.get('processing_time', elapsed)
+        result['few_shot'] = {
+            'mode': mode,
+            'object_name': target if has_target else 'example object',
+            'added_references': len(support_paths),
+            'total_references': len(support_paths),
+            'similarity_score': result.get('confidence'),
+        }
 
         try:
             instruction_result = pipeline.generate_instruction(
@@ -305,7 +313,7 @@ def process_example():
     except RuntimeError as e:
         if "CUDA" in str(e) or "cuda" in str(e):
             print(f"[API FATAL] Unhandled CUDA error in example flow: {e}")
-            return jsonify({'error': 'Example model processing error on the selected device'}), 500
+            return jsonify({'error': 'Hybrid example processing error on the selected device'}), 500
         raise
     except Exception as e:
         print(f"[API ERROR] process-example {type(e).__name__}: {e}")
@@ -432,7 +440,12 @@ def add_few_shot_reference():
             image_array = np.array(image).astype(np.uint8)
             
             # Add to few-shot matcher
-            pipeline.few_shot_matcher.add_reference(object_name, image_array)
+            load_result = pipeline.load_support_references(
+                object_name=object_name,
+                support_images=[image_array],
+                replace_existing=False,
+            )
+            object_name = load_result.get('object_name', object_name)
             
             return jsonify({
                 'success': True,

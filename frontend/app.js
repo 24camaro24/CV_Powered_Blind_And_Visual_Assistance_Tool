@@ -70,9 +70,6 @@ class NavigationApp {
                 <section class="section example-section" aria-labelledby="exampleTitle">
                     <h2 id="exampleTitle">Find by Example</h2>
 
-                    <label class="field-label" for="exampleLabelInput">Object label</label>
-                    <input type="text" id="exampleLabelInput" class="target-input" placeholder="my keys">
-
                     <div class="upload-box" id="supportUploadBox" role="button" tabindex="0" aria-label="Upload example images">
                         <p class="upload-text">Drop example images or browse</p>
                         <p class="upload-hint">Up to 10 object images</p>
@@ -573,8 +570,9 @@ class NavigationApp {
             return;
         }
 
-        if (this.supportFiles.length === 0) {
-            this.showError('Add at least one example image.');
+        const target = this.el('targetInput').value.trim();
+        if (this.supportFiles.length === 0 && !target) {
+            this.showError('Add example images or enter a target in the Target box.');
             return;
         }
 
@@ -592,10 +590,9 @@ class NavigationApp {
                 throw new Error('Choose a scene image or turn on the camera first.');
             }
 
-            const label = this.el('exampleLabelInput').value.trim() || 'example object';
             const formData = new FormData();
             formData.append('filename', filename);
-            formData.append('target', label);
+            formData.append('target', target);
             this.supportFiles.forEach((file) => {
                 formData.append('support_images', file, file.name);
             });
@@ -898,19 +895,30 @@ class NavigationApp {
     }
 
     formatFewShot(fewShot) {
-        const existence = this.asNumber(fewShot.existence_prob, null);
+        const existence = this.asNumber(
+            fewShot.similarity_score ?? fewShot.existence_prob,
+            null
+        );
         const localizer = this.asNumber(fewShot.localizer_score, null);
         const bgProb = this.asNumber(fewShot.bg_prob, null);
+        const addedRefs = this.asNumber(fewShot.added_references, null);
+        const totalRefs = this.asNumber(fewShot.total_references, null);
         const parts = [];
 
         if (Number.isFinite(existence)) {
-            parts.push(`similarity ${Math.round(existence * 100)}%`);
+            parts.push(`hybrid score ${Math.round(existence * 100)}%`);
         }
         if (Number.isFinite(localizer)) {
             parts.push(`box ${Math.round(localizer * 100)}%`);
         }
         if (Number.isFinite(bgProb)) {
             parts.push(`background ${Math.round(bgProb * 100)}%`);
+        }
+        if (Number.isFinite(addedRefs)) {
+            parts.push(`${Math.max(0, Math.round(addedRefs))} refs loaded`);
+        }
+        if (Number.isFinite(totalRefs)) {
+            parts.push(`${Math.max(0, Math.round(totalRefs))} refs total`);
         }
 
         return parts.length > 0 ? parts.join(', ') : 'Available';
