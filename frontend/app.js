@@ -11,12 +11,37 @@ class NavigationApp {
         this.audioChunks = [];
         this.videoStream = null;
         this.blindModeUsingCamera = true;  // Track which image source is used in blind mode
+        this.savedReferences = [];
         this.init();
     }
     
     init() {
         this.renderModeSelection();
         this.checkBackendHealth();
+        this.loadReferences();
+    }
+
+    renderReferenceSection() {
+        return `
+            <div class="section" style="grid-column: 1 / -1;">
+                <h2>Reference Images</h2>
+                <p style="color: #666; font-size: 0.95em; margin-bottom: 15px;">Save a named reference image for personal objects and reuse it during search.</p>
+                <div style="display: grid; grid-template-columns: 1.1fr 1fr auto; gap: 12px; align-items: end; margin-bottom: 16px;">
+                    <div>
+                        <label for="referenceNameInput" style="display:block; color:#667eea; font-weight:600; margin-bottom:6px;">Reference Name</label>
+                        <input type="text" id="referenceNameInput" class="target-input" placeholder="e.g. my black watch">
+                    </div>
+                    <div>
+                        <label for="referenceImageInput" style="display:block; color:#667eea; font-weight:600; margin-bottom:6px;">Reference Image</label>
+                        <input type="file" id="referenceImageInput" accept="image/*" style="display:block; width:100%;">
+                    </div>
+                    <button class="btn-primary" id="saveReferenceBtn" style="min-width: 180px;">Save Reference</button>
+                </div>
+                <div id="referencePreview" style="margin-bottom: 14px;"></div>
+                <div id="referenceStatus" style="margin-bottom: 14px;"></div>
+                <div id="referenceList"></div>
+            </div>
+        `;
     }
     
     renderModeSelection() {
@@ -47,12 +72,26 @@ class NavigationApp {
         
         document.getElementById('blindModeCard').addEventListener('click', () => this.selectMode('blind'));
         document.getElementById('visuallyImpairedModeCard').addEventListener('click', () => this.selectMode('visually-impaired'));
+        const modeSelection = document.querySelector('.mode-selection');
+        if (modeSelection) {
+            modeSelection.insertAdjacentHTML('beforeend', `
+                <div class="mode-card" id="referenceModeCard">
+                    <div class="mode-icon">Refs</div>
+                    <h2>Add Reference</h2>
+                    <p>Save named reference images for personal objects</p>
+                    <p style="font-size: 0.9em; color: #999;">Upload a reference image once, then reuse it automatically while searching.</p>
+                </div>
+            `);
+            document.getElementById('referenceModeCard').addEventListener('click', () => this.selectMode('references'));
+        }
     }
     
     selectMode(mode) {
         this.mode = mode;
         if (mode === 'blind') {
             this.renderBlindMode();
+        } else if (mode === 'references') {
+            this.renderReferenceManager();
         } else {
             this.renderVisuallyImpairedMode();
         }
@@ -99,6 +138,7 @@ class NavigationApp {
                         
                         <div id="audioTranscript" style="margin-top: 15px;"></div>
                     </div>
+                    
                 </div>
                 
                 <div style="text-align: center; margin: 30px 0;">
@@ -159,6 +199,7 @@ class NavigationApp {
                         
                         <div id="audioTranscript" style="margin-top: 10px;"></div>
                     </div>
+
                 </div>
                 
                 <!-- Process Button -->
@@ -175,6 +216,24 @@ class NavigationApp {
         `;
         
         this.setupVisuallyImpairedModeListeners();
+    }
+
+    renderReferenceManager() {
+        const root = document.getElementById('root');
+        root.innerHTML = `
+            <div class="container">
+                <h1>Reference Images</h1>
+                <p style="text-align: center; color: #666; margin-bottom: 30px;">Save named reference images like phone, spectacle, comb, bottle, or watch.</p>
+
+                ${this.renderReferenceSection()}
+
+                <button class="btn-secondary" id="backBtn" style="width: 100%; max-width: 300px; display: block; margin: 24px auto 0; padding: 12px 30px;">Back to Mode Selection</button>
+            </div>
+        `;
+
+        this.setupReferenceListeners();
+        this.renderReferenceList();
+        document.getElementById('backBtn').addEventListener('click', () => this.init());
     }
     
     setupBlindModeListeners() {
@@ -365,6 +424,222 @@ class NavigationApp {
             }
             this.init();
         });
+    }
+
+    setupReferenceListeners() {
+        const referenceImageInput = document.getElementById('referenceImageInput');
+        const saveReferenceBtn = document.getElementById('saveReferenceBtn');
+
+        if (referenceImageInput) {
+            referenceImageInput.addEventListener('change', (event) => {
+                const file = event.target.files && event.target.files[0];
+                const preview = document.getElementById('referencePreview');
+                if (!preview) {
+                    return;
+                }
+                if (!file) {
+                    preview.innerHTML = '';
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    preview.innerHTML = `
+                        <div style="display:flex; gap:12px; align-items:center; background:#f8f9ff; padding:12px; border-radius:10px;">
+                            <img src="${e.target.result}" class="preview-image" style="max-width:120px; max-height:120px; margin:0;">
+                            <div>
+                                <p style="margin:0; color:#333; font-weight:600;">${file.name}</p>
+                                <p style="margin:6px 0 0; color:#666; font-size:0.9em;">Ready to save as a personal reference</p>
+                            </div>
+                        </div>
+                    `;
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        if (saveReferenceBtn) {
+            saveReferenceBtn.addEventListener('click', () => this.saveReference());
+        }
+    }
+
+    loadReferences() {
+        return fetch(`${API_BASE_URL}/references`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    this.savedReferences = data.references || [];
+                    this.renderReferenceList();
+                }
+            })
+            .catch(() => {
+                this.savedReferences = [];
+                this.renderReferenceList();
+            });
+    }
+
+    renderReferenceList() {
+        const container = document.getElementById('referenceList');
+        if (!container) {
+            return;
+        }
+
+        if (!this.savedReferences.length) {
+            container.innerHTML = `
+                <div style="padding:14px; border-radius:10px; background:#f8f9ff; color:#666;">
+                    No saved references yet.
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = this.savedReferences.map(reference => `
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:14px; background:white; border:1px solid #e5e7eb; border-radius:12px; padding:12px 14px; margin-bottom:10px;">
+                <div style="display:flex; align-items:center; gap:12px; min-width:0;">
+                    ${reference.image_base64 ? `<img src="data:image/jpeg;base64,${reference.image_base64}" style="width:64px; height:64px; object-fit:cover; border-radius:10px; border:2px solid #667eea;">` : ''}
+                    <div style="min-width:0;">
+                        <p style="margin:0; font-weight:700; color:#333;">${reference.name}</p>
+                        <p style="margin:4px 0 0; color:#666; font-size:0.88em;">Saved reference</p>
+                    </div>
+                </div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+                    <button class="btn-secondary" data-reference-use="${reference.normalized_name}" style="padding:10px 14px;">Use</button>
+                    <button class="btn-secondary" data-reference-delete="${reference.normalized_name}" style="padding:10px 14px; border-color:#dc3545; color:#dc3545;">Delete</button>
+                </div>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('[data-reference-use]').forEach(button => {
+            button.addEventListener('click', () => this.applyReference(button.dataset.referenceUse));
+        });
+        container.querySelectorAll('[data-reference-delete]').forEach(button => {
+            button.addEventListener('click', () => this.deleteReference(button.dataset.referenceDelete));
+        });
+    }
+
+    setReferenceStatus(message, isError = false) {
+        const status = document.getElementById('referenceStatus');
+        if (!status) {
+            return;
+        }
+        status.innerHTML = `
+            <div style="padding:12px 14px; border-radius:10px; background:${isError ? '#fdecea' : '#e8f5e9'}; color:${isError ? '#b3261e' : '#2e7d32'}; font-weight:600;">
+                ${message}
+            </div>
+        `;
+    }
+
+    saveReference() {
+        const nameInput = document.getElementById('referenceNameInput');
+        const fileInput = document.getElementById('referenceImageInput');
+        const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+        const name = nameInput ? nameInput.value.trim() : '';
+
+        if (!name) {
+            this.setReferenceStatus('Please enter a reference name.', true);
+            return;
+        }
+        if (!file) {
+            this.setReferenceStatus('Please choose a reference image.', true);
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('name', name);
+        formData.append('image', file);
+        this.setReferenceStatus('Saving reference...', false);
+
+        fetch(`${API_BASE_URL}/references`, {
+            method: 'POST',
+            body: formData
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (!data.success) {
+                throw new Error(data.error || 'Failed to save reference');
+            }
+            this.savedReferences = data.references || [];
+            if (nameInput) {
+                nameInput.value = '';
+            }
+            if (fileInput) {
+                fileInput.value = '';
+            }
+            const preview = document.getElementById('referencePreview');
+            if (preview) {
+                preview.innerHTML = '';
+            }
+            this.renderReferenceList();
+            this.setReferenceStatus(`Saved reference "${data.reference.name}".`, false);
+        })
+        .catch(err => this.setReferenceStatus(err.message, true));
+    }
+
+    deleteReference(normalizedName) {
+        fetch(`${API_BASE_URL}/references/${encodeURIComponent(normalizedName)}`, {
+            method: 'DELETE'
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (!data.success) {
+                throw new Error(data.error || 'Failed to delete reference');
+            }
+            this.savedReferences = data.references || [];
+            this.renderReferenceList();
+            this.setReferenceStatus('Reference deleted.', false);
+        })
+        .catch(err => this.setReferenceStatus(err.message, true));
+    }
+
+    applyReference(normalizedName) {
+        const reference = this.savedReferences.find(item => item.normalized_name === normalizedName);
+        if (!reference) {
+            return;
+        }
+
+        if (this.mode === 'visually-impaired') {
+            const targetInput = document.getElementById('targetInput');
+            if (targetInput) {
+                targetInput.value = reference.name;
+            }
+        } else if (this.mode === 'blind') {
+            const transcript = `
+                <div style="background: #e8f5e9; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                    <p style="color: #333; margin-bottom: 5px;"><strong>Reference selected:</strong> ${reference.name}</p>
+                    <p style="color: #667eea;"><strong>Target:</strong> <strong style="font-size: 1.1em; color: #28a745;">${reference.name}</strong></p>
+                </div>
+            `;
+            const transcriptContainer = document.getElementById('audioTranscript');
+            if (transcriptContainer) {
+                transcriptContainer.innerHTML = transcript;
+            }
+            const processBtn = document.getElementById('processBtn');
+            if (processBtn) {
+                processBtn.style.display = 'block';
+            }
+        }
+
+        this.setReferenceStatus(`Using saved reference "${reference.name}" for the next search.`, false);
+        this.clearResults();
+    }
+
+    findReferenceForTarget(target) {
+        const normalizedTarget = target
+            .trim()
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!normalizedTarget) {
+            return null;
+        }
+
+        const targetWords = normalizedTarget.split(' ');
+        return this.savedReferences.find(reference => {
+            const referenceName = (reference.normalized_name || '').trim().toLowerCase();
+            return referenceName && targetWords.includes(referenceName);
+        }) || null;
     }
     
     handleImageUploadVisuallyImpaired(file) {
@@ -667,13 +942,15 @@ class NavigationApp {
     
     processImageWithTarget(filename, target) {
         this.showLoading('Processing image...');
+        const matchingReference = this.findReferenceForTarget(target);
         
         fetch(`${API_BASE_URL}/process`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 filename: filename,
-                target: target
+                target: target,
+                reference_name: matchingReference ? matchingReference.normalized_name : null
             })
         })
         .then(res => res.json())
@@ -724,9 +1001,16 @@ class NavigationApp {
         const angleSign = data.angle > 0 ? '→' : '←';
         const directionEmoji = data.angle > 0 ? '➡️' : '⬅️';
         
+        const referenceIndicator = data.reference_name ? `
+                <div style="margin-bottom: 20px; padding: 14px 18px; background: #eef6ff; border: 1px solid #b9d7ff; border-radius: 12px; color: #1f4f8a; text-align: center;">
+                    <strong>Reference used:</strong> ${data.reference_name}${typeof data.reference_score === 'number' ? ` <span style="color:#4b5563;">(match ${(data.reference_score * 100).toFixed(0)}%)</span>` : ''}
+                </div>
+        ` : '';
+
         // Clear navigation instructions with full understanding
         const visual = `
             <div class="results">
+                ${referenceIndicator}
                 <h2 style="color: #667eea; margin-bottom: 40px; font-size: 1.8em; text-align: center;">🧭 Navigation Instructions</h2>
                 
                 <div style="margin-bottom: 30px; padding: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 12px; color: white; text-align: center;">

@@ -14,7 +14,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 BACKEND_DIR = REPO_ROOT / "backend"
 DEFAULT_INPUT_DIR = REPO_ROOT / "test_images"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "evaluation_runs"
+DEFAULT_REFERENCE_DIR = REPO_ROOT / "reference_images"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+TARGET_REFERENCE_IMAGES = {
+    "comb": "comb.jpeg",
+}
 YOLO_CLASS_NAMES = {
     0: "phone",
     1: "comb",
@@ -62,6 +66,11 @@ def parse_args():
         action="store_true",
         help="Reduce console output to the final summary only.",
     )
+    parser.add_argument(
+        "--reference-dir",
+        default=str(DEFAULT_REFERENCE_DIR),
+        help="Directory containing optional per-target reference images.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +101,18 @@ def decode_base64_to_file(encoded, output_path):
 def log(message, quiet=False):
     if not quiet:
         print(message)
+
+
+def build_reference_plan(reference_dir):
+    plan = {}
+    for target, filename in TARGET_REFERENCE_IMAGES.items():
+        image_path = reference_dir / filename
+        plan[target] = {
+            "filename": filename,
+            "image_path": image_path,
+            "exists": image_path.exists(),
+        }
+    return plan
 
 
 def collect_images(input_dir, requested_images):
@@ -244,6 +265,9 @@ def make_record(image_path, target, expected_targets):
         "target": target,
         "expected_targets": expected_targets,
         "expected_present": target in expected_targets,
+        "reference_used": False,
+        "reference_name": None,
+        "reference_image_path": None,
     }
 
 
@@ -256,6 +280,9 @@ def write_csv(csv_path, rows):
         "image_name",
         "target",
         "expected_present",
+        "reference_used",
+        "reference_name",
+        "reference_image_path",
         "has_ground_truth",
         "match_status",
         "matched",
@@ -356,6 +383,7 @@ def main():
 
     input_dir = Path(args.input_dir).resolve()
     output_root = Path(args.output_dir).resolve()
+    reference_dir = Path(args.reference_dir).resolve()
     requested_targets = {target.lower().strip() for target in args.target if target.strip()}
 
     if not input_dir.exists():
@@ -369,6 +397,7 @@ def main():
     log("Evaluation configuration:", args.quiet)
     log(f"  input_dir:  {input_dir}", args.quiet)
     log(f"  output_dir: {output_root}", args.quiet)
+    log(f"  reference_dir: {reference_dir}", args.quiet)
     log(f"  device arg: {args.device}", args.quiet)
     log(f"  image count discovered: {len(images)}", args.quiet)
     if requested_targets:
@@ -387,6 +416,22 @@ def main():
         log("Model status:", args.quiet)
         for model_name, status in pipeline.model_status.items():
             log(f"  - {model_name}: {status}", args.quiet)
+    reference_plan = build_reference_plan(reference_dir)
+    registered_references = []
+    log("Reference plan:", args.quiet)
+    for target, info in sorted(reference_plan.items()):
+        if info["exists"]:
+            pipeline.register_reference_image(target, info["image_path"], display_name=target)
+            registered_references.append(
+                {
+                    "target": target,
+                    "reference_name": target,
+                    "image_path": str(info["image_path"]),
+                }
+            )
+            log(f"  - {target}: loaded {info['image_path']}", args.quiet)
+        else:
+            log(f"  - {target}: missing {info['image_path']}", args.quiet)
     log("", args.quiet)
 
     run_dir = build_run_dir(output_root)
@@ -396,9 +441,19 @@ def main():
         "created_at": datetime.now().isoformat(),
         "input_dir": str(input_dir),
         "output_dir": str(run_dir),
+        "reference_dir": str(reference_dir),
         "device": pipeline.get_device_str(),
         "pipeline_init_time_sec": round(pipeline_init_elapsed, 4),
         "model_status": getattr(pipeline, "model_status", {}),
+        "reference_plan": {
+            target: {
+                "filename": info["filename"],
+                "image_path": str(info["image_path"]),
+                "exists": info["exists"],
+            }
+            for target, info in sorted(reference_plan.items())
+        },
+        "registered_references": registered_references,
         "images": [],
     }
 
@@ -438,13 +493,22 @@ def main():
             record = make_record(image_path, target, expected_targets)
             record_dir = image_run_dir / slugify(target)
             record_dir.mkdir(parents=True, exist_ok=True)
+            target_reference = reference_plan.get(target)
+            reference_name = target if target_reference and target_reference["exists"] else None
+            record["reference_used"] = bool(reference_name)
+            record["reference_name"] = reference_name
+            record["reference_image_path"] = str(target_reference["image_path"]) if reference_name else None
 
             log("-" * 72, args.quiet)
             log(f"Running target search: '{target}'", args.quiet)
             log(f"Per-target artifact directory: {record_dir}", args.quiet)
+            if reference_name:
+                log(f"Reference-assisted search enabled: {reference_name} -> {target_reference['image_path']}", args.quiet)
+            else:
+                log("Reference-assisted search enabled: none", args.quiet)
 
             process_started = time.perf_counter()
-            process_result = pipeline.process_image(str(image_path), target)
+            process_result = pipeline.process_image(str(image_path), target, reference_name=reference_name)
             process_elapsed = time.perf_counter() - process_started
 
             record["process_time_sec"] = round(process_elapsed, 4)
@@ -471,6 +535,8 @@ def main():
                 "image_name": image_path.name,
                 "image_path": str(image_path),
                 "target": target,
+                "reference_name": reference_name,
+                "reference_image_path": str(target_reference["image_path"]) if reference_name else None,
                 "expected_targets": expected_targets,
                 "ground_truth": ground_truth,
                 "timing": {
