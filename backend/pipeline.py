@@ -1102,10 +1102,23 @@ class NavigationPipeline:
             
             # Activate Siamese network: boost confidence using few-shot matching if available
             logits = self.hybrid_detect_and_match(img_np, image_tensor, target, boxes, logits)
-            logger.info("Post-Siamese confidence=%s", float(logits[0].item()) if torch.is_tensor(logits[0]) else float(logits[0]))
+            if logits is None or len(logits) == 0:
+                return {
+                    'success': False,
+                    'error': f'Target "{target}" not detected reliably in image'
+                }
+
+            if torch.is_tensor(logits):
+                best_idx = int(torch.argmax(logits).item())
+                best_confidence = float(logits[best_idx].item())
+            else:
+                best_idx = max(range(len(logits)), key=lambda idx: float(logits[idx]))
+                best_confidence = float(logits[best_idx])
+
+            logger.info("Selected detection index=%s confidence=%s", best_idx, best_confidence)
             
-            # Get bounding box
-            box = boxes[0] * torch.tensor([w, h, w, h])
+            # Get the highest-confidence bounding box
+            box = boxes[best_idx] * torch.tensor([w, h, w, h])
             cx, cy, bw, bh = box
             x1 = int(cx - bw/2)
             y1 = int(cy - bh/2)
@@ -1269,7 +1282,7 @@ class NavigationPipeline:
                 'depth': float(obj_depth),
                 'bbox': [x1, y1, x2, y2],
                 'visualization': img_base64,
-                'confidence': float(logits[0].item() if logits is not None else 0),
+                'confidence': float(best_confidence),
                 'processing_time': float(processing_time),
                 'surfaces': surfaces  # New: spatial relationship info
             }
